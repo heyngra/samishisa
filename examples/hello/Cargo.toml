@@ -1,0 +1,12 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+description = "Demo extension: greetings, a visit counter, caching and errors"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+samishisa.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "samishisa-macros"
+description = "Procedural macros for the samishisa extension SDK (use the `samishisa` crate instead)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true

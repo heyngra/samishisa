@@ -1,0 +1,72 @@
+package samishisa:extension@0.1.0;
+
+interface types {
+    record api-error {
+        status: u16,
+        code: option<string>,
+        message: string,
+        hint: option<string>,
+        details-json: option<string>,
+    }
+
+    record request {
+        route: u32,
+        method: string,
+        path: string,
+        input-json: string,
+        headers: list<tuple<string, string>>,
+        request-id: string,
+    }
+
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+}
+
+interface host {
+    use types.{api-error};
+
+    enum log-level { debug, info, warn, error }
+
+    log: func(level: log-level, message: string);
+
+    store-get: func(key: string) -> option<string>;
+    store-set: func(key: string, value-json: string, ttl-seconds: option<u32>);
+    store-delete: func(key: string);
+    store-incr: func(key: string, by: s64) -> s64;
+    store-keys: func(prefix: string) -> list<string>;
+
+    record http-request {
+        method: string,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+    fetch: func(req: http-request) -> result<http-response, api-error>;
+}
+
+interface extension {
+    use types.{api-error, request, response};
+
+    manifest: func() -> string;
+
+    init: func(config-json: string) -> result<_, string>;
+
+    setup: func() -> result<_, string>;
+
+    handle: func(req: request) -> result<response, api-error>;
+
+    run-job: func(job: u32) -> result<_, string>;
+}
+
+world plugin {
+    import host;
+    export extension;
+}
