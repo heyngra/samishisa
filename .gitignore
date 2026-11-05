@@ -1,0 +1,10 @@
+node_modules
+data
+*.log
+.env
+dist
+target
+proto/bench
+*.cwasm
+.zed
+proto/build-host.log

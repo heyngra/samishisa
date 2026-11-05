@@ -1,0 +1,24 @@
+package samishisa:proto@0.1.0;
+
+interface host {
+  log: func(msg: string);
+}
+
+interface handler {
+  record request {
+    route: u32,
+    input: string,
+  }
+  record response {
+    status: u16,
+    content-type: string,
+    body: list<u8>,
+  }
+  manifest: func() -> string;
+  handle: func(req: request) -> response;
+}
+
+world extension {
+  import host;
+  export handler;
+}
