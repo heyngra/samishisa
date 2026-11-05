@@ -1,4 +1,6 @@
 #![deny(missing_docs)]
+#![doc = ""]
+#![cfg_attr(doctest, doc = include_str!("../../../README.md"))]
 #![warn(rustdoc::broken_intra_doc_links)]
 
 mod ctx;

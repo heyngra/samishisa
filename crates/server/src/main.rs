@@ -360,7 +360,10 @@ fn cmd_serve(args: &[String]) -> anyhow::Result<()> {
         let abs = std::fs::canonicalize(a).with_context(|| format!("{a} not found"))?;
         cfg.extensions.push(Entry::Source(abs.display().to_string()));
     }
-    if cfg.extensions.is_empty() {
+    if cfg.extensions.is_empty() && !path.exists() && !sources::BUILTIN_HELLO.is_empty() {
+        log_info!("core", "no {} here: serving the built-in example (builtin:hello). Run `samishisa init` to create a config.", path.display());
+        cfg.extensions.push(Entry::Source("builtin:hello".into()));
+    } else if cfg.extensions.is_empty() {
         log_warn!("core", "no extensions configured: run `samishisa init`, add some to api.config.json, or pass .wasm files (`samishisa serve hello.wasm`)");
     }
     warn_if_world_readable(&cfg);

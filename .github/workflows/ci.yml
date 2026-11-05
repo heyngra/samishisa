@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the extensions
+        run: cargo build --release --locked --target wasm32-wasip2 -p hello -p probe
+      - name: Build the server (embeds builtin:hello)
+        run: cargo build --release --locked -p samishisa-server
+      - name: Unit tests
+        run: cargo test --release --locked -p samishisa-server
+      - name: SDK doc tests
+        run: cargo test --locked --doc -p samishisa
+      - name: End-to-end tests (incl. Redis)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: python3 tests/e2e.py target/release/samishisa

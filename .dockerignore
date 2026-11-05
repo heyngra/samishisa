@@ -1,0 +1,6 @@
+target
+proto/target
+.git
+.zed
+data
+*.log

@@ -1,0 +1,21 @@
+services:
+  samishisa:
+    image: ghcr.io/heyngra/samishisa:latest
+    ports: ["${PORT:-3000}:3000"]
+    volumes:
+      - ./config:/config
+      - samishisa-data:/data
+    environment:
+      REDIS_URL: ${REDIS_URL:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    profiles: [redis]
+    restart: unless-stopped
+
+volumes:
+  samishisa-data:

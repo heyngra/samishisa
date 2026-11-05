@@ -1,0 +1,143 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - run: cargo build --release --locked --target wasm32-wasip2 -p hello
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello.wasm
+          path: target/wasm32-wasip2/release/hello.wasm
+
+  build:
+    needs: hello
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: ".2.28", asset: samishisa-linux-x64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, zig: ".2.28", asset: samishisa-linux-arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: "", asset: samishisa-linux-x64-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, zig: "", asset: samishisa-linux-arm64-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: samishisa-macos-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, asset: samishisa-macos-x64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, asset: samishisa-windows-x64.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: hello.wasm
+          path: embed
+      - name: Install zig + cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: pip install ziglang cargo-zigbuild
+      - name: Build (Linux, via zig)
+        if: runner.os == 'Linux'
+        env:
+          SAMISHISA_HELLO_WASM: ${{ github.workspace }}/embed/hello.wasm
+        run: cargo zigbuild --release --locked -p samishisa-server --target ${{ matrix.target }}${{ matrix.zig }}
+      - name: Build (macOS / Windows)
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          SAMISHISA_HELLO_WASM: ${{ github.workspace }}/embed/hello.wasm
+        run: cargo build --release --locked -p samishisa-server --target ${{ matrix.target }}
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          src="target/${{ matrix.target }}/release/samishisa"
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "dist/${{ matrix.asset }}"
+      - name: Smoke test (native targets)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          ./dist/${{ matrix.asset }} version
+          ./dist/${{ matrix.asset }} init smoke
+          cd smoke && (../dist/${{ matrix.asset }} --port 3999 &) && sleep 3
+          curl -fsS localhost:3999/hello/world
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    needs: [hello, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          cp install.sh install.ps1 dist/
+          cd dist && sha256sum samishisa-* hello.wasm > SHA256SUMS && cat SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Docker context with the prebuilt static binaries
+        run: |
+          mkdir -p ctx
+          cp artifacts/samishisa-linux-x64-musl/samishisa-linux-x64-musl ctx/samishisa-amd64
+          cp artifacts/samishisa-linux-arm64-musl/samishisa-linux-arm64-musl ctx/samishisa-arm64
+          chmod +x ctx/samishisa-*
+          mkdir -p ctx/config ctx/data && touch ctx/config/.keep ctx/data/.keep
+          cp docker/Dockerfile.release ctx/Dockerfile
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+
+  crates:
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ vars.PUBLISH_CRATES == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --locked -p samishisa-macros
+          cargo publish --locked -p samishisa
