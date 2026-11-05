@@ -40,6 +40,33 @@ pub fn write(level: Level, target: &str, msg: &str) {
     eprintln!("{} {tag} [{target}] {msg}", utc_now());
 }
 
+static ACCESS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static FLUSHER: std::sync::Once = std::sync::Once::new();
+
+pub fn access(line: String) {
+    FLUSHER.call_once(|| {
+        std::thread::Builder::new()
+            .name("access-log".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let buf = std::mem::take(&mut *ACCESS.lock().unwrap());
+                if !buf.is_empty() {
+                    use std::io::Write;
+                    let _ = std::io::stderr().write_all(&buf);
+                }
+            })
+            .expect("spawning the access-log thread");
+    });
+    let stamp = utc_now();
+    let mut buf = ACCESS.lock().unwrap();
+    if buf.len() < 8 << 20 {
+        buf.extend_from_slice(stamp.as_bytes());
+        buf.extend_from_slice(b" ACCESS ");
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+    }
+}
+
 fn utc_now() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));

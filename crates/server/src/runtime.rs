@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -18,35 +17,53 @@ use wasmtime::{
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-use crate::log::{self, Level};
+use crate::{
+    log::{self, Level},
+    netguard::{Egress, OutRequest, Policy},
+    store::Store as KvStore,
+};
 
-wasmtime::component::bindgen!({ world: "plugin", path: "../sdk/wit", exports: { default: async } });
+wasmtime::component::bindgen!({
+    world: "plugin",
+    path: "../sdk/wit",
+    imports: { "samishisa:extension/host.fetch": async },
+    exports: { default: async },
+});
 
 pub use samishisa::extension::types::{ApiError as WitError, Request as WitRequest, Response as WitResponse};
 use samishisa::extension::host::{self as wit_host, LogLevel};
 
 pub const TICK: Duration = Duration::from_millis(10);
-const MEMORY_LIMIT: usize = 64 << 20;
-const MAX_INSTANCES_TOTAL: u32 = 512;
 const MAX_INSTANCES_PER_EXT: usize = 64;
 const RECYCLE_AFTER_CALLS: u32 = 10_000;
 
-pub fn engine(pooled: bool) -> anyhow::Result<Engine> {
-    let mut pool = PoolingAllocationConfig::default();
-    pool.total_component_instances(MAX_INSTANCES_TOTAL)
-        .total_core_instances(MAX_INSTANCES_TOTAL * 4)
-        .total_memories(MAX_INSTANCES_TOTAL)
-        .total_tables(MAX_INSTANCES_TOTAL * 4)
-        .total_stacks(MAX_INSTANCES_TOTAL)
-        .max_memory_size(MEMORY_LIMIT);
-    let mut cfg = WasmConfig::new();
-    cfg.epoch_interruption(true)
-        .memory_reservation(MEMORY_LIMIT as u64)
-        .memory_guard_size(64 << 10);
-    if pooled {
-        cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    }
-    let engine = Engine::new(&cfg).map_err(anyhow::Error::from)?;
+pub fn engine(pool_slots: Option<u32>, max_memory_mb: u32) -> anyhow::Result<Engine> {
+    let memory = (max_memory_mb as usize) << 20;
+    let make = |pooled: Option<u32>| {
+        let mut cfg = WasmConfig::new();
+        cfg.epoch_interruption(true)
+            .memory_reservation(memory as u64)
+            .memory_guard_size(64 << 10);
+        if let Some(n) = pooled {
+            let mut pool = PoolingAllocationConfig::default();
+            pool.total_component_instances(n)
+                .total_core_instances(n * 4)
+                .total_memories(n)
+                .total_tables(n * 4)
+                .total_stacks(n)
+                .max_memory_size(memory);
+            cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+        }
+        Engine::new(&cfg).map_err(anyhow::Error::from)
+    };
+    let engine = match pool_slots.map(|n| make(Some(n))) {
+        Some(Ok(e)) => e,
+        Some(Err(e)) => {
+            log::write(Level::Warn, "core", &format!("could not reserve the instance pool ({e:#}); allocating instances on demand instead (lower \"maxInstances\" to use the pool)"));
+            make(None)?
+        }
+        None => make(None)?,
+    };
     let e = engine.clone();
     std::thread::Builder::new().name("epoch".into()).spawn(move || loop {
         std::thread::sleep(TICK);
@@ -83,7 +100,9 @@ pub fn load_component(engine: &Engine, wasm_path: &Path, cache_dir: &Path) -> an
 
 pub struct Shared {
     pub name: String,
-    pub store: MemoryStore,
+    pub store: Arc<KvStore>,
+    pub egress: Arc<Egress>,
+    pub policy: Policy,
 }
 
 pub struct State {
@@ -115,58 +134,22 @@ impl wit_host::Host for State {
         self.shared.store.get(&key)
     }
     fn store_set(&mut self, key: String, value_json: String, ttl_seconds: Option<u32>) {
-        self.shared.store.set(key, value_json, ttl_seconds.map(|s| Duration::from_secs(s.into())))
+        self.shared.store.set(&key, &value_json, ttl_seconds.map(|s| Duration::from_secs(s.into())))
     }
     fn store_delete(&mut self, key: String) {
         self.shared.store.delete(&key)
     }
     fn store_incr(&mut self, key: String, by: i64) -> i64 {
-        self.shared.store.incr(key, by)
+        self.shared.store.incr(&key, by)
     }
     fn store_keys(&mut self, prefix: String) -> Vec<String> {
         self.shared.store.keys(&prefix)
     }
-    fn fetch(&mut self, _req: wit_host::HttpRequest) -> Result<wit_host::HttpResponse, WitError> {
-        Err(WitError {
-            status: 501,
-            code: Some("fetch_unavailable".into()),
-            message: "Outbound HTTP is not available in this samishisa build yet".into(),
-            hint: None,
-            details_json: None,
-        })
-    }
-}
-
-#[derive(Default)]
-pub struct MemoryStore {
-    map: Mutex<HashMap<String, (String, Option<Instant>)>>,
-}
-
-impl MemoryStore {
-    fn live(entry: &(String, Option<Instant>)) -> bool {
-        entry.1.is_none_or(|t| t > Instant::now())
-    }
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.map.lock().unwrap().get(key).filter(|e| Self::live(e)).map(|e| e.0.clone())
-    }
-    pub fn set(&self, key: String, value: String, ttl: Option<Duration>) {
-        self.map.lock().unwrap().insert(key, (value, ttl.map(|t| Instant::now() + t)));
-    }
-    pub fn delete(&self, key: &str) {
-        self.map.lock().unwrap().remove(key);
-    }
-    pub fn incr(&self, key: String, by: i64) -> i64 {
-        let mut m = self.map.lock().unwrap();
-        let current = m.get(&key).filter(|e| Self::live(e)).and_then(|e| e.0.parse::<i64>().ok()).unwrap_or(0);
-        let next = current.saturating_add(by);
-        let ttl = m.get(&key).and_then(|e| e.1);
-        m.insert(key, (next.to_string(), ttl));
-        next
-    }
-    pub fn keys(&self, prefix: &str) -> Vec<String> {
-        let mut k: Vec<String> = self.map.lock().unwrap().iter().filter(|(k, e)| k.starts_with(prefix) && Self::live(e)).map(|(k, _)| k.clone()).collect();
-        k.sort();
-        k
+    async fn fetch(&mut self, req: wit_host::HttpRequest) -> Result<wit_host::HttpResponse, WitError> {
+        let shared = self.shared.clone();
+        let out = OutRequest { method: req.method, url: req.url, headers: req.headers, body: req.body };
+        let r = shared.egress.fetch(&shared.name, &shared.policy, out).await?;
+        Ok(wit_host::HttpResponse { status: r.status, headers: r.headers, body: r.body })
     }
 }
 
@@ -250,17 +233,60 @@ pub struct Runner {
     engine: Engine,
     shared: Arc<Shared>,
     config_json: String,
+    memory: usize,
     pool: Mutex<Vec<Inst>>,
     live: AtomicUsize,
 }
 
+pub struct LoadOptions {
+    pub alias: Option<String>,
+    pub config: Value,
+    pub source: String,
+    pub open_store: Box<dyn FnOnce(&str) -> anyhow::Result<Arc<KvStore>> + Send>,
+    pub egress: Arc<Egress>,
+    pub network: Option<Value>,
+    pub memory_mb: u32,
+}
+
+struct Lease<'a> {
+    runner: &'a Runner,
+    inst: Option<Inst>,
+}
+
+impl Lease<'_> {
+    fn inst(&mut self) -> &mut Inst {
+        self.inst.as_mut().expect("leased")
+    }
+    fn give_back(mut self) {
+        if let Some(i) = self.inst.take() {
+            self.runner.give_back(i);
+        }
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if self.inst.take().is_some() {
+            self.runner.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 impl Runner {
-    pub async fn load(engine: &Engine, linker: &Linker<State>, wasm: &Path, cache_dir: &Path, alias: Option<&str>, config: Value, source: String) -> anyhow::Result<Arc<Runner>> {
+    pub async fn load(engine: &Engine, linker: &Linker<State>, wasm: &Path, cache_dir: &Path, opts: LoadOptions) -> anyhow::Result<Arc<Runner>> {
+        let LoadOptions { alias, config, source, open_store, egress, network, memory_mb } = opts;
+        let alias = alias.as_deref();
+        let memory = (memory_mb as usize) << 20;
         let component = load_component(engine, wasm, cache_dir)?;
         let pre = PluginPre::new(linker.instantiate_pre(&component).map_err(anyhow::Error::from).context("the component needs imports samishisa doesn't provide (was it built with the samishisa SDK?)")?).map_err(anyhow::Error::from)?;
 
-        let probe_shared = Arc::new(Shared { name: alias.unwrap_or("extension").to_owned(), store: MemoryStore::default() });
-        let mut store = new_store(engine, probe_shared, Duration::from_secs(5));
+        let probe_shared = Arc::new(Shared {
+            name: alias.unwrap_or("extension").to_owned(),
+            store: Arc::new(KvStore::open(None)?),
+            egress: egress.clone(),
+            policy: Policy::None,
+        });
+        let mut store = new_store(engine, probe_shared, Duration::from_secs(5), memory);
         let plugin = pre.instantiate_async(&mut store).await.map_err(anyhow::Error::from)?;
         let raw = plugin.samishisa_extension_extension().call_manifest(&mut store).await.map_err(anyhow::Error::from).context("reading the extension's manifest")?;
         let manifest: Manifest = serde_json::from_str(&raw).context("the extension's manifest is not valid")?;
@@ -280,14 +306,16 @@ impl Runner {
         }
 
         let mount = alias.unwrap_or(&manifest.name).to_owned();
-        let shared = Arc::new(Shared { name: mount.clone(), store: MemoryStore::default() });
+        let policy = Policy::from_value(network.as_ref().or(manifest.network.as_ref()));
+        let shared = Arc::new(Shared { name: mount.clone(), store: open_store(&mount)?, egress, policy });
         let runner = Arc::new(Runner {
-            manifest, mount, source, pre, engine: engine.clone(), shared, config_json: config.to_string(),
+            manifest, mount, source, pre, engine: engine.clone(), shared, config_json: config.to_string(), memory,
             pool: Mutex::new(Vec::new()), live: AtomicUsize::new(0),
         });
 
-        let mut inst = runner.checkout().await.map_err(|e| anyhow::anyhow!("{}", call_error_text(&e)))?;
+        let mut lease = runner.checkout().await.map_err(|e| anyhow::anyhow!("{}", call_error_text(&e)))?;
         if runner.manifest.setup {
+            let inst = lease.inst();
             inst.store.set_epoch_deadline(ticks(Duration::from_secs(30)));
             let r = inst.plugin.samishisa_extension_extension().call_setup(&mut inst.store).await;
             match r {
@@ -296,20 +324,24 @@ impl Runner {
                 Err(e) => bail!("setup crashed: {}", trap_text(&e)),
             }
         }
-        runner.give_back(inst);
+        lease.give_back();
         Ok(runner)
     }
 
-    async fn checkout(&self) -> Result<Inst, CallError> {
+    pub fn policy(&self) -> &Policy {
+        &self.shared.policy
+    }
+
+    async fn checkout(&self) -> Result<Lease<'_>, CallError> {
         if let Some(i) = self.pool.lock().unwrap().pop() {
-            return Ok(i);
+            return Ok(Lease { runner: self, inst: Some(i) });
         }
         if self.live.fetch_add(1, Ordering::SeqCst) >= MAX_INSTANCES_PER_EXT {
             self.live.fetch_sub(1, Ordering::SeqCst);
             return Err(CallError::Busy);
         }
         let made = async {
-            let mut store = new_store(&self.engine, self.shared.clone(), Duration::from_secs(5));
+            let mut store = new_store(&self.engine, self.shared.clone(), Duration::from_secs(5), self.memory);
             let plugin = self.pre.instantiate_async(&mut store).await.map_err(|e| CallError::Crashed(format!("instantiate: {e:?}")))?;
             match plugin.samishisa_extension_extension().call_init(&mut store, &self.config_json).await {
                 Ok(Ok(())) => Ok(Inst { store, plugin, calls: 0 }),
@@ -318,10 +350,13 @@ impl Runner {
             }
         }
         .await;
-        if made.is_err() {
-            self.live.fetch_sub(1, Ordering::SeqCst);
+        match made {
+            Ok(i) => Ok(Lease { runner: self, inst: Some(i) }),
+            Err(e) => {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                Err(e)
+            }
         }
-        made
     }
 
     fn give_back(&self, mut inst: Inst) {
@@ -333,49 +368,40 @@ impl Runner {
         self.pool.lock().unwrap().push(inst);
     }
 
-    fn discard(&self, inst: Inst) {
-        drop(inst);
-        self.live.fetch_sub(1, Ordering::SeqCst);
-    }
-
     pub async fn handle(&self, req: WitRequest, timeout: Duration) -> Result<Result<WitResponse, WitError>, CallError> {
-        let mut inst = self.checkout().await?;
+        let mut lease = self.checkout().await?;
+        let inst = lease.inst();
         inst.store.set_epoch_deadline(ticks(timeout));
         let r = inst.plugin.samishisa_extension_extension().call_handle(&mut inst.store, &req).await;
         match r {
             Ok(answer) => {
-                self.give_back(inst);
+                lease.give_back();
                 Ok(answer)
             }
-            Err(e) => {
-                self.discard(inst);
-                Err(classify(e))
-            }
+            Err(e) => Err(classify(e)),
         }
     }
 
     pub async fn run_job(&self, index: u32) -> Result<Result<(), String>, CallError> {
-        let mut inst = self.checkout().await?;
+        let mut lease = self.checkout().await?;
+        let inst = lease.inst();
         inst.store.set_epoch_deadline(ticks(Duration::from_secs(60)));
         let r = inst.plugin.samishisa_extension_extension().call_run_job(&mut inst.store, index).await;
         match r {
             Ok(answer) => {
-                self.give_back(inst);
+                lease.give_back();
                 Ok(answer)
             }
-            Err(e) => {
-                self.discard(inst);
-                Err(classify(e))
-            }
+            Err(e) => Err(classify(e)),
         }
     }
 }
 
-fn new_store(engine: &Engine, shared: Arc<Shared>, deadline: Duration) -> Store<State> {
+fn new_store(engine: &Engine, shared: Arc<Shared>, deadline: Duration, memory: usize) -> Store<State> {
     let state = State {
         wasi: WasiCtx::builder().build(),
         table: ResourceTable::new(),
-        limits: StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).instances(32).build(),
+        limits: StoreLimitsBuilder::new().memory_size(memory).instances(32).build(),
         shared,
     };
     let mut store = Store::new(engine, state);

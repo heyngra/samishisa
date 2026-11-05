@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::{
     ApiError, Config, Ctx, Extension, RequestParts,
@@ -106,8 +106,14 @@ impl<C: Config> Erased for Built<C> {
         let fail = |e: ApiError| e.into_wit(Some(&request_id));
         let route = self.ext.routes.get(req.route as usize).ok_or_else(|| fail(ApiError::internal("Unknown route index")))?;
         let ctx = self.ctx(Some(request_id.clone())).map_err(|m| fail(ApiError::internal(m)))?;
-        let input: Value = serde_json::from_str(&req.input_json).map_err(|e| fail(e.into()))?;
-        let parts = RequestParts { input, method: req.method, path: req.path, headers: req.headers, ctx };
+        #[derive(serde::Deserialize)]
+        struct Input {
+            params: Box<serde_json::value::RawValue>,
+            query: Box<serde_json::value::RawValue>,
+            body: Box<serde_json::value::RawValue>,
+        }
+        let input: Input = serde_json::from_str(&req.input_json).map_err(|e| fail(e.into()))?;
+        let parts = RequestParts { params: input.params, query: input.query, body: input.body, method: req.method, path: req.path, headers: req.headers, ctx };
         match (route.handler)(&parts) {
             Ok(r) => Ok(wit::Response { status: r.status, headers: r.headers, body: r.body }),
             Err(e) => Err(fail(e)),
@@ -141,6 +147,8 @@ pub fn manifest(build: fn() -> Box<dyn Erased>) -> String {
 }
 
 pub fn init(build: fn() -> Box<dyn Erased>, config_json: &str) -> Result<(), String> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| std::panic::set_hook(Box::new(|info| host::log(host::LogLevel::Error, &format!("panicked: {info}")))));
     with(Some(build), |e| e.init(config_json)).unwrap_or(Err(NOT_READY.into()))
 }
 

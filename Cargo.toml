@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/server", "crates/sdk", "crates/macros", "examples/hello"]
+members = ["crates/server", "crates/sdk", "crates/macros", "examples/hello", "tests/probe"]
 default-members = ["crates/server", "crates/macros"]
 
 [workspace.package]

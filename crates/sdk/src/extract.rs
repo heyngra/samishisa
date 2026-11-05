@@ -8,7 +8,9 @@ use crate::{
 };
 
 pub struct RequestParts<C> {
-    pub(crate) input: Value,
+    pub(crate) params: Box<serde_json::value::RawValue>,
+    pub(crate) query: Box<serde_json::value::RawValue>,
+    pub(crate) body: Box<serde_json::value::RawValue>,
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) headers: Vec<(String, String)>,
@@ -25,8 +27,13 @@ impl<C> RequestParts<C> {
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers
     }
-    pub fn input(&self, part: &str) -> &Value {
-        self.input.get(part).unwrap_or(&Value::Null)
+    pub fn input_json(&self, part: &str) -> &str {
+        match part {
+            "params" => self.params.get(),
+            "query" => self.query.get(),
+            "body" => self.body.get(),
+            _ => "null",
+        }
     }
     pub fn ctx(&self) -> &Ctx<C> {
         &self.ctx
@@ -49,16 +56,16 @@ pub struct Path<T>(pub T);
 
 impl<C, T: DeserializeOwned + JsonSchema> FromRequest<C> for Path<T> {
     fn from_request(req: &RequestParts<C>) -> Result<Self> {
-        let params = req.input("params");
-        match serde_json::from_value::<T>(params.clone()) {
+        let raw = req.input_json("params");
+        match serde_json::from_str::<T>(raw) {
             Ok(v) => Ok(Path(v)),
-            Err(e) => match params {
-                Value::Object(m) if m.len() == 1 => {
-                    let only = m.values().next().cloned().unwrap_or(Value::Null);
-                    serde_json::from_value(only).map(Path).map_err(|e| invalid("path parameter", e))
+            Err(e) => {
+                let map: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> = serde_json::from_str(raw).unwrap_or_default();
+                match (map.len(), map.into_values().next()) {
+                    (1, Some(only)) => serde_json::from_str(only.get()).map(Path).map_err(|e| invalid("path parameter", e)),
+                    _ => Err(invalid("path parameters", e)),
                 }
-                _ => Err(invalid("path parameters", e)),
-            },
+            }
         }
     }
 
@@ -92,11 +99,11 @@ pub struct Query<T>(pub T);
 
 impl<C, T: DeserializeOwned + JsonSchema> FromRequest<C> for Query<T> {
     fn from_request(req: &RequestParts<C>) -> Result<Self> {
-        let q = match req.input("query") {
-            Value::Null => Value::Object(Default::default()),
-            v => v.clone(),
+        let raw = match req.input_json("query") {
+            "null" => "{}",
+            q => q,
         };
-        serde_json::from_value(q).map(Query).map_err(|e| invalid("query", e))
+        serde_json::from_str(raw).map(Query).map_err(|e| invalid("query", e))
     }
     fn describe(route: &mut RouteSpec) {
         route.set_query(schema_of::<T>());
@@ -108,7 +115,7 @@ pub struct Json<T>(pub T);
 
 impl<C, T: DeserializeOwned + JsonSchema> FromRequest<C> for Json<T> {
     fn from_request(req: &RequestParts<C>) -> Result<Self> {
-        serde_json::from_value(req.input("body").clone()).map(Json).map_err(|e| invalid("body", e))
+        serde_json::from_str(req.input_json("body")).map(Json).map_err(|e| invalid("body", e))
     }
     fn describe(route: &mut RouteSpec) {
         route.set_body(schema_of::<T>());
