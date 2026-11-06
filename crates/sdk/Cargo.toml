@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["api", "wasm", "plugin", "extension", "server"]
 categories = ["wasm", "web-programming::http-server"]
-include = ["src/**", "wit/**", "Cargo.toml", "README.md"]
+include = ["src/**", "wit/**", "Cargo.toml"]
 
 [dependencies]
 samishisa-macros.workspace = true
