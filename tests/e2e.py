@@ -219,6 +219,7 @@ def main():
         check("short busy work completes", st == 200 and b == "done", b)
         st, _, b = req(p, "/probe/oom")
         check("memory bomb hits the cap (500)", st == 500, st)
+        check("...and the log says it ran out of memory", "ran out of memory (the cap is 64 MB" in s.logtext())
         st, _, b = req(p, "/probe/panic")
         check("panic is a clean 500", st == 500 and b["error"]["code"] == "internal_error", b)
         check("...and the panic message is in the log", "panicked on purpose" in s.logtext())

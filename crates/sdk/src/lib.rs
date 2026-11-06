@@ -1,5 +1,4 @@
 #![deny(missing_docs)]
-#![doc = ""]
 #![cfg_attr(doctest, doc = include_str!("../../../README.md"))]
 #![warn(rustdoc::broken_intra_doc_links)]
 
@@ -71,13 +70,13 @@ macro_rules! export {
                     $crate::__rt::init(__build, &config_json)
                 }
                 fn setup() -> ::std::result::Result<(), ::std::string::String> {
-                    $crate::__rt::setup()
+                    $crate::__rt::setup(__build)
                 }
                 fn handle(req: __types::Request) -> ::std::result::Result<__types::Response, __types::ApiError> {
-                    $crate::__rt::handle(req)
+                    $crate::__rt::handle(__build, req)
                 }
                 fn run_job(job: u32) -> ::std::result::Result<(), ::std::string::String> {
-                    $crate::__rt::run_job(job)
+                    $crate::__rt::run_job(__build, job)
                 }
             }
         };

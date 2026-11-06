@@ -1,6 +1,6 @@
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::{
     ApiError, Ctx, Result,
@@ -27,13 +27,14 @@ impl<C> RequestParts<C> {
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers
     }
-    pub fn input_json(&self, part: &str) -> &str {
-        match part {
-            "params" => self.params.get(),
-            "query" => self.query.get(),
-            "body" => self.body.get(),
-            _ => "null",
-        }
+    pub fn params_json(&self) -> &str {
+        self.params.get()
+    }
+    pub fn query_json(&self) -> &str {
+        self.query.get()
+    }
+    pub fn body_json(&self) -> &str {
+        self.body.get()
     }
     pub fn ctx(&self) -> &Ctx<C> {
         &self.ctx
@@ -56,7 +57,7 @@ pub struct Path<T>(pub T);
 
 impl<C, T: DeserializeOwned + JsonSchema> FromRequest<C> for Path<T> {
     fn from_request(req: &RequestParts<C>) -> Result<Self> {
-        let raw = req.input_json("params");
+        let raw = req.params_json();
         match serde_json::from_str::<T>(raw) {
             Ok(v) => Ok(Path(v)),
             Err(e) => {
@@ -99,7 +100,7 @@ pub struct Query<T>(pub T);
 
 impl<C, T: DeserializeOwned + JsonSchema> FromRequest<C> for Query<T> {
     fn from_request(req: &RequestParts<C>) -> Result<Self> {
-        let raw = match req.input_json("query") {
+        let raw = match req.query_json() {
             "null" => "{}",
             q => q,
         };
@@ -115,7 +116,7 @@ pub struct Json<T>(pub T);
 
 impl<C, T: DeserializeOwned + JsonSchema> FromRequest<C> for Json<T> {
     fn from_request(req: &RequestParts<C>) -> Result<Self> {
-        serde_json::from_str(req.input_json("body")).map(Json).map_err(|e| invalid("body", e))
+        serde_json::from_str(req.body_json()).map(Json).map_err(|e| invalid("body", e))
     }
     fn describe(route: &mut RouteSpec) {
         route.set_body(schema_of::<T>());

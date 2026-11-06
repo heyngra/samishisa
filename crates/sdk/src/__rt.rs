@@ -41,10 +41,9 @@ impl ApiError {
         }
     }
 
-    fn into_wit(self, request_id: Option<&str>) -> wit::ApiError {
+    fn into_wit(self, request_id: &str) -> wit::ApiError {
         if let Some(internal) = &self.internal {
-            let id = request_id.map(|i| format!("[{i}] ")).unwrap_or_default();
-            host::log(host::LogLevel::Error, &format!("{id}{} {}: {internal}", self.status, self.message));
+            host::log(host::LogLevel::Error, &format!("[{request_id}] {} {}: {internal}", self.status, self.message));
         }
         wit::ApiError {
             status: self.status.clamp(400, 599),
@@ -103,7 +102,7 @@ impl<C: Config> Erased for Built<C> {
 
     fn handle(&self, req: wit::Request) -> Result<wit::Response, wit::ApiError> {
         let request_id: Rc<str> = Rc::from(req.request_id.as_str());
-        let fail = |e: ApiError| e.into_wit(Some(&request_id));
+        let fail = |e: ApiError| e.into_wit(&request_id);
         let route = self.ext.routes.get(req.route as usize).ok_or_else(|| fail(ApiError::internal("Unknown route index")))?;
         let ctx = self.ctx(Some(request_id.clone())).map_err(|m| fail(ApiError::internal(m)))?;
         #[derive(serde::Deserialize)]
@@ -130,36 +129,28 @@ thread_local! {
     static EXT: RefCell<Option<Box<dyn Erased>>> = const { RefCell::new(None) };
 }
 
-fn with<R>(build: Option<fn() -> Box<dyn Erased>>, f: impl FnOnce(&mut dyn Erased) -> R) -> Option<R> {
-    EXT.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(build?());
-        }
-        Some(f(slot.as_mut()?.as_mut()))
-    })
+fn with<R>(build: fn() -> Box<dyn Erased>, f: impl FnOnce(&mut dyn Erased) -> R) -> R {
+    EXT.with(|cell| f(cell.borrow_mut().get_or_insert_with(build).as_mut()))
 }
 
-const NOT_READY: &str = "the extension was called before manifest/init";
-
 pub fn manifest(build: fn() -> Box<dyn Erased>) -> String {
-    with(Some(build), |e| e.manifest()).unwrap_or_default()
+    with(build, |e| e.manifest())
 }
 
 pub fn init(build: fn() -> Box<dyn Erased>, config_json: &str) -> Result<(), String> {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| std::panic::set_hook(Box::new(|info| host::log(host::LogLevel::Error, &format!("panicked: {info}")))));
-    with(Some(build), |e| e.init(config_json)).unwrap_or(Err(NOT_READY.into()))
+    with(build, |e| e.init(config_json))
 }
 
-pub fn setup() -> Result<(), String> {
-    with(None, |e| e.setup()).unwrap_or(Err(NOT_READY.into()))
+pub fn setup(build: fn() -> Box<dyn Erased>) -> Result<(), String> {
+    with(build, |e| e.setup())
 }
 
-pub fn handle(req: wit::Request) -> Result<wit::Response, wit::ApiError> {
-    with(None, |e| e.handle(req)).unwrap_or_else(|| Err(ApiError::internal(NOT_READY).into_wit(None)))
+pub fn handle(build: fn() -> Box<dyn Erased>, req: wit::Request) -> Result<wit::Response, wit::ApiError> {
+    with(build, |e| e.handle(req))
 }
 
-pub fn run_job(job: u32) -> Result<(), String> {
-    with(None, |e| e.run_job(job)).unwrap_or(Err(NOT_READY.into()))
+pub fn run_job(build: fn() -> Box<dyn Erased>, job: u32) -> Result<(), String> {
+    with(build, |e| e.run_job(job))
 }

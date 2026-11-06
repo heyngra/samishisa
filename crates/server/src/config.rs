@@ -1,134 +1,130 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use crate::{clientip::TrustProxy, ratelimit::Setting};
+use crate::{
+    clientip::TrustProxy,
+    netguard::Policy,
+    ratelimit::{Limit, RateSetting},
+};
+
+pub const DEFAULT_MEMORY_MB: u32 = 64;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
-    #[serde(default = "default_port")]
     pub port: u16,
-    #[serde(default = "default_host")]
     pub host: String,
-    #[serde(default)]
     pub threads: usize,
-    #[serde(default = "default_timeout")]
     pub request_timeout_ms: u64,
-    #[serde(default = "default_body")]
     pub max_body_bytes: usize,
-    #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    #[serde(default = "default_rate")]
-    pub rate_limit: Value,
-    #[serde(default = "default_trust")]
-    pub trust_proxy: Value,
-    #[serde(default)]
+    pub rate_limit: RateSetting,
+    pub trust_proxy: TrustProxy,
     pub redis: Option<String>,
-    #[serde(default)]
     pub network: NetworkConfig,
-    #[serde(default = "yes")]
     pub access_log: bool,
-    #[serde(default = "yes")]
     pub compression: bool,
-    #[serde(default = "yes")]
     pub cors: bool,
-    #[serde(default = "default_instances")]
     pub max_instances: u32,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub extensions: Vec<Entry>,
+    pub title: String,
+    pub extensions: Vec<ExtensionEntry>,
     #[serde(skip)]
     pub base_dir: PathBuf,
     #[serde(skip)]
     pub path: Option<PathBuf>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            port: 3000,
+            host: "0.0.0.0".into(),
+            threads: 0,
+            request_timeout_ms: 10_000,
+            max_body_bytes: 1 << 20,
+            data_dir: PathBuf::from("data"),
+            rate_limit: RateSetting::On(Limit { limit: 600, window_sec: 60, global: false }),
+            trust_proxy: TrustProxy::Private,
+            redis: None,
+            network: NetworkConfig::default(),
+            access_log: true,
+            compression: true,
+            cors: true,
+            max_instances: 256,
+            title: "samishisa".into(),
+            extensions: Vec::new(),
+            base_dir: PathBuf::from("."),
+            path: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct NetworkConfig {
-    #[serde(default)]
     pub allow_private: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum Entry {
-    Source(String),
-    Full(FullEntry),
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct FullEntry {
+#[derive(Debug, Clone)]
+pub struct ExtensionEntry {
     pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rate_limit: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_mb: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Value,
+    pub network: Option<Policy>,
+    pub rate_limit: RateSetting,
+    pub memory_mb: u32,
     pub asset: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
 
-impl Entry {
-    pub fn full(&self) -> FullEntry {
-        match self {
-            Entry::Source(s) => FullEntry { source: s.clone(), ..Default::default() },
-            Entry::Full(f) => f.clone(),
+impl ExtensionEntry {
+    pub fn from_source(source: impl Into<String>) -> Self {
+        ExtensionEntry {
+            source: source.into(),
+            name: None,
+            config: Value::Object(Default::default()),
+            network: None,
+            rate_limit: RateSetting::Inherit,
+            memory_mb: DEFAULT_MEMORY_MB,
+            asset: None,
+            sha256: None,
         }
     }
-    pub fn source(&self) -> &str {
-        match self {
-            Entry::Source(s) => s,
-            Entry::Full(f) => &f.source,
-        }
-    }
 }
 
-pub const DEFAULT_MEMORY_MB: u32 = 64;
-
-fn default_port() -> u16 {
-    3000
-}
-fn default_host() -> String {
-    "0.0.0.0".into()
-}
-fn default_timeout() -> u64 {
-    10_000
-}
-fn default_body() -> usize {
-    1 << 20
-}
-fn default_data_dir() -> PathBuf {
-    PathBuf::from("data")
-}
-fn default_rate() -> Value {
-    serde_json::json!({ "limit": 600, "windowSec": 60 })
-}
-fn default_trust() -> Value {
-    Value::String("private".into())
-}
-fn default_instances() -> u32 {
-    256
-}
-fn yes() -> bool {
-    true
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EntryObject {
+    source: String,
+    name: Option<String>,
+    config: Option<Value>,
+    network: Option<Policy>,
+    #[serde(default)]
+    rate_limit: RateSetting,
+    memory_mb: Option<u32>,
+    asset: Option<String>,
+    sha256: Option<String>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        serde_json::from_str("{}").expect("defaults")
+impl<'de> Deserialize<'de> for ExtensionEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let object = match Value::deserialize(deserializer)? {
+            Value::String(source) => return Ok(ExtensionEntry::from_source(source)),
+            other => EntryObject::deserialize(other).map_err(|e| serde::de::Error::custom(format!("in an extension entry: {e}")))?,
+        };
+        Ok(ExtensionEntry {
+            source: object.source,
+            name: object.name,
+            config: object.config.unwrap_or_else(|| Value::Object(Default::default())),
+            network: object.network,
+            rate_limit: object.rate_limit,
+            memory_mb: object.memory_mb.unwrap_or(DEFAULT_MEMORY_MB),
+            asset: object.asset,
+            sha256: object.sha256,
+        })
     }
 }
 
@@ -136,69 +132,49 @@ impl Config {
     pub fn load(path: &Path, must_exist: bool) -> anyhow::Result<Self> {
         let mut cfg = if path.exists() {
             let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            let mut c = serde_json::from_str::<Config>(&text).with_context(|| format!("{} is not a valid samishisa config", path.display()))?;
-            c.path = Some(path.to_path_buf());
-            c
+            let mut cfg: Config = serde_json::from_str(&text).with_context(|| format!("{} is not a valid samishisa config", path.display()))?;
+            cfg.path = Some(path.to_path_buf());
+            cfg
         } else if must_exist {
             bail!("config file {} not found (create one with `samishisa init`)", path.display());
         } else {
             Config::default()
         };
-        cfg.base_dir = path.parent().map(Path::to_path_buf).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
-        if let Ok(p) = std::env::var("PORT") {
-            cfg.port = p.parse().context("PORT must be a number")?;
+        cfg.base_dir = path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+        if let Ok(port) = std::env::var("PORT") {
+            cfg.port = port.parse().context("PORT must be a number")?;
         }
-        if let Ok(r) = std::env::var("REDIS_URL") {
-            if !r.is_empty() {
-                cfg.redis = Some(r);
+        if let Ok(url) = std::env::var("REDIS_URL").map(|u| u.trim().to_owned()) {
+            if !url.is_empty() {
+                cfg.redis = Some(url);
             }
         }
-        if let Ok(d) = std::env::var("SAMISHISA_DATA") {
-            cfg.data_dir = PathBuf::from(d);
+        if let Ok(dir) = std::env::var("SAMISHISA_DATA") {
+            cfg.data_dir = PathBuf::from(dir);
         }
         if cfg.data_dir.is_relative() {
             cfg.data_dir = cfg.base_dir.join(&cfg.data_dir);
         }
-        cfg.rate_setting()?;
-        cfg.trust()?;
         if cfg.max_instances == 0 {
             bail!("maxInstances must be at least 1");
-        }
-        for (i, e) in cfg.extensions.iter().enumerate() {
-            let f = e.full();
-            Setting::from_value(f.rate_limit.as_ref(), &format!("extensions[{i}].rateLimit"))?;
-            if let Some(n) = &f.network {
-                if !(n.as_str() == Some("*") || n.as_array().is_some_and(|a| a.iter().all(Value::is_string))) {
-                    bail!("extensions[{i}].network must be a list of hosts or \"*\"");
-                }
-            }
         }
         Ok(cfg)
     }
 
-    pub fn rate_setting(&self) -> anyhow::Result<Setting> {
-        Setting::from_value(Some(&self.rate_limit), "rateLimit")
-    }
-
-    pub fn trust(&self) -> anyhow::Result<TrustProxy> {
-        TrustProxy::from_value(&self.trust_proxy)
-    }
-
-    pub fn resolve_path(&self, p: &str) -> PathBuf {
-        let p = match p.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default().join(rest),
-            None => PathBuf::from(p),
-        };
-        if p.is_absolute() { p } else { self.base_dir.join(p) }
+    pub fn serving_threads(&self) -> usize {
+        match self.threads {
+            0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            n => n,
+        }
     }
 
     pub fn max_memory_mb(&self) -> u32 {
-        self.extensions.iter().filter_map(|e| e.full().memory_mb).max().unwrap_or(DEFAULT_MEMORY_MB).max(DEFAULT_MEMORY_MB)
+        self.extensions.iter().map(|e| e.memory_mb).max().unwrap_or(DEFAULT_MEMORY_MB).max(DEFAULT_MEMORY_MB)
     }
 }
 
-pub fn interpolate_env(v: &Value, at: &str) -> anyhow::Result<Value> {
-    Ok(match v {
+pub fn interpolate_env(value: &Value, at: &str) -> anyhow::Result<Value> {
+    Ok(match value {
         Value::String(s) if s.contains("${") => {
             let mut out = String::new();
             let mut rest = s.as_str();
@@ -206,15 +182,14 @@ pub fn interpolate_env(v: &Value, at: &str) -> anyhow::Result<Value> {
                 out.push_str(&rest[..start]);
                 let end = rest[start..].find('}').with_context(|| format!("{at}: unclosed ${{ in {s:?}"))? + start;
                 let var = &rest[start + 2..end];
-                let val = std::env::var(var).with_context(|| format!("{at}: environment variable {var} is not set"))?;
-                out.push_str(&val);
+                out.push_str(&std::env::var(var).with_context(|| format!("{at}: environment variable {var} is not set"))?);
                 rest = &rest[end + 1..];
             }
             out.push_str(rest);
             Value::String(out)
         }
-        Value::Array(a) => Value::Array(a.iter().enumerate().map(|(i, x)| interpolate_env(x, &format!("{at}[{i}]"))).collect::<Result<_, _>>()?),
-        Value::Object(o) => Value::Object(o.iter().map(|(k, x)| Ok((k.clone(), interpolate_env(x, &format!("{at}.{k}"))?))).collect::<anyhow::Result<_>>()?),
+        Value::Array(items) => Value::Array(items.iter().enumerate().map(|(i, x)| interpolate_env(x, &format!("{at}[{i}]"))).collect::<anyhow::Result<_>>()?),
+        Value::Object(fields) => Value::Object(fields.iter().map(|(k, x)| Ok((k.clone(), interpolate_env(x, &format!("{at}.{k}"))?))).collect::<anyhow::Result<_>>()?),
         other => other.clone(),
     })
 }
@@ -227,17 +202,29 @@ mod tests {
     fn env_interpolation() {
         unsafe { std::env::set_var("SAMISHISA_TEST_KEY", "k123") };
         let v = serde_json::json!({ "a": "${SAMISHISA_TEST_KEY}", "b": ["x-${SAMISHISA_TEST_KEY}-y"], "c": 1 });
-        let out = interpolate_env(&v, "config").unwrap();
-        assert_eq!(out, serde_json::json!({ "a": "k123", "b": ["x-k123-y"], "c": 1 }));
+        assert_eq!(interpolate_env(&v, "config").unwrap(), serde_json::json!({ "a": "k123", "b": ["x-k123-y"], "c": 1 }));
         let err = interpolate_env(&serde_json::json!("${SAMISHISA_MISSING_VAR}"), "config.x").unwrap_err();
         assert!(err.to_string().contains("SAMISHISA_MISSING_VAR"));
     }
 
     #[test]
     fn entries() {
-        let c: Config = serde_json::from_str(r#"{ "extensions": ["./a.wasm", { "source": "github:o/r#v1", "name": "x", "rateLimit": false }] }"#).unwrap();
-        assert_eq!(c.extensions[0].source(), "./a.wasm");
-        assert_eq!(c.extensions[1].full().name.as_deref(), Some("x"));
-        assert!(serde_json::from_str::<Config>(r#"{ "prot": 1 }"#).is_err(), "typos in the config are errors");
+        let c: Config = serde_json::from_str(r#"{ "extensions": ["./a.wasm", { "source": "github:o/r#v1", "name": "x", "rateLimit": false, "memoryMb": 128 }] }"#).unwrap();
+        assert_eq!(c.extensions[0].source, "./a.wasm");
+        assert_eq!(c.extensions[0].memory_mb, DEFAULT_MEMORY_MB);
+        assert_eq!(c.extensions[1].name.as_deref(), Some("x"));
+        assert_eq!(c.extensions[1].rate_limit, RateSetting::Off);
+        assert_eq!(c.max_memory_mb(), 128);
+        assert_eq!(c.port, 3000, "missing fields take their defaults");
+    }
+
+    #[test]
+    fn mistakes_are_errors() {
+        let error = |json: &str| serde_json::from_str::<Config>(json).unwrap_err().to_string();
+        assert!(error(r#"{ "prot": 1 }"#).contains("prot"));
+        assert!(error(r#"{ "extensions": [{ "source": "x", "nmae": "y" }] }"#).contains("nmae"));
+        assert!(error(r#"{ "extensions": [{ "source": "x", "network": "example.com" }] }"#).contains("network"));
+        assert!(error(r#"{ "rateLimit": { "limit": -1 } }"#).contains("limit"));
+        assert!(error(r#"{ "trustProxy": "sometimes" }"#).contains("trustProxy"));
     }
 }

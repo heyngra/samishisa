@@ -1,27 +1,24 @@
 use std::{
     future::Future,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use redis::aio::ConnectionManager;
 use tokio::sync::Mutex;
 
-use crate::log::{self, Level};
+use crate::{clock::now_ms, log::log_warn};
 
 const CALL_TIMEOUT: Duration = Duration::from_millis(150);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const COOLDOWN_MS: u64 = 5_000;
+const WARN_AT_MOST_EVERY_MS: u64 = 30_000;
 
 pub struct RedisGuard {
     client: redis::Client,
     conn: Mutex<Option<ConnectionManager>>,
     down_until: AtomicU64,
     warned_at: AtomicU64,
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 impl RedisGuard {
@@ -66,9 +63,9 @@ impl RedisGuard {
         if let Err(e) = &result {
             let now = now_ms();
             self.down_until.store(now + COOLDOWN_MS, Ordering::Relaxed);
-            if now.saturating_sub(self.warned_at.load(Ordering::Relaxed)) > 30_000 {
+            if now.saturating_sub(self.warned_at.load(Ordering::Relaxed)) > WARN_AT_MOST_EVERY_MS {
                 self.warned_at.store(now, Ordering::Relaxed);
-                log::write(Level::Warn, "core", &format!("redis unavailable ({e}); using per-process rate limits and cache for {}s", COOLDOWN_MS / 1000));
+                log_warn!("core", "redis unavailable ({e}); using per-process rate limits and cache for {}s", COOLDOWN_MS / 1000);
             }
         }
         result

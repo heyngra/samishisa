@@ -1,87 +1,37 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    fmt,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Request, Uri};
+use hyper::{Request, Uri, body::Incoming};
 use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time::Instant};
 
-use crate::runtime::WitError;
+use crate::ipnet::is_private_ip;
 
-pub fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_private_v4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_private_v4(v4);
-            }
-            let s = v6.segments();
-            v6.is_unspecified()
-                || v6.is_loopback()
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xff00) == 0xff00
-                || (s[0] == 0x64 && s[1] == 0xff9b)
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
-                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                || (s[0] == 0x2002)
-        }
-    }
-}
-
-fn is_private_v4(ip: Ipv4Addr) -> bool {
-    const NETS: &[([u8; 4], u8)] = &[
-        ([0, 0, 0, 0], 8),
-        ([10, 0, 0, 0], 8),
-        ([100, 64, 0, 0], 10),
-        ([127, 0, 0, 0], 8),
-        ([169, 254, 0, 0], 16),
-        ([172, 16, 0, 0], 12),
-        ([192, 0, 0, 0], 24),
-        ([192, 0, 2, 0], 24),
-        ([192, 168, 0, 0], 16),
-        ([198, 18, 0, 0], 15),
-        ([198, 51, 100, 0], 24),
-        ([203, 0, 113, 0], 24),
-        ([224, 0, 0, 0], 4),
-        ([240, 0, 0, 0], 4),
-    ];
-    let n = u32::from(ip);
-    NETS.iter().any(|(base, bits)| {
-        let mask = if *bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-        n & mask == u32::from(Ipv4Addr::from(*base)) & mask
-    })
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Policy {
+    #[default]
     None,
     Any,
     Hosts(Vec<String>),
 }
 
 impl Policy {
-    pub fn from_value(v: Option<&Value>) -> Policy {
-        match v {
-            Some(Value::String(s)) if s == "*" => Policy::Any,
-            Some(Value::Array(a)) => Policy::Hosts(a.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).collect()),
-            _ => Policy::None,
-        }
-    }
-
     pub fn allows(&self, host: &str) -> bool {
-        let h = host.to_ascii_lowercase();
+        let host = host.to_ascii_lowercase();
         match self {
             Policy::None => false,
             Policy::Any => true,
-            Policy::Hosts(list) => list.iter().any(|p| match p.strip_prefix("*.") {
-                Some(suffix) => h.len() > suffix.len() + 1 && h.ends_with(suffix) && h.as_bytes()[h.len() - suffix.len() - 1] == b'.',
-                None => *p == h,
+            Policy::Hosts(patterns) => patterns.iter().any(|pattern| match pattern.strip_prefix("*.") {
+                Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(suffix) && host.as_bytes()[host.len() - suffix.len() - 1] == b'.',
+                None => *pattern == host,
             }),
         }
     }
@@ -90,16 +40,22 @@ impl Policy {
         match self {
             Policy::None => "none".into(),
             Policy::Any => "any public host".into(),
-            Policy::Hosts(h) => h.join(", "),
+            Policy::Hosts(hosts) => hosts.join(", "),
         }
     }
 }
 
-pub struct Egress {
-    tls: tokio_rustls::TlsConnector,
-    pub allow_private: bool,
-    pub max_bytes: usize,
-    pub timeout: Duration,
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Option::<Value>::deserialize(deserializer)? {
+            None => Ok(Policy::None),
+            Some(Value::String(s)) if s == "*" => Ok(Policy::Any),
+            Some(Value::Array(items)) if items.iter().all(Value::is_string) => {
+                Ok(Policy::Hosts(items.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).collect()))
+            }
+            Some(other) => Err(serde::de::Error::custom(format!("\"network\" must be a list of hosts or \"*\" (got {other})"))),
+        }
+    }
 }
 
 pub struct OutRequest {
@@ -115,21 +71,88 @@ pub struct OutResponse {
     pub body: Vec<u8>,
 }
 
-const MAX_REDIRECTS: usize = 5;
-const UPSTREAM_HINT: &str = "This is a problem with a service this endpoint depends on, not with your request. Retry shortly.";
+#[derive(Debug)]
+pub struct FetchError {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+    pub hint: Option<String>,
+    pub details: Option<Value>,
+}
 
-pub fn api_error(status: u16, code: &str, message: impl Into<String>, hint: Option<&str>, details: Option<Value>) -> WitError {
-    WitError {
-        status,
-        code: Some(code.into()),
-        message: message.into(),
-        hint: hint.map(Into::into),
-        details_json: details.map(|d| d.to_string()),
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)?;
+        if let Some(d) = &self.details {
+            write!(f, " {d}")?;
+        }
+        Ok(())
     }
 }
 
+const UPSTREAM_HINT: &str = "This is a problem with a service this endpoint depends on, not with your request. Retry shortly.";
+
+fn bad_url(message: impl Into<String>, hint: Option<&str>) -> FetchError {
+    FetchError { status: 400, code: "bad_upstream_url", message: message.into(), hint: hint.map(Into::into), details: None }
+}
+
+fn upstream_unreachable(host: &str, reason: &dyn fmt::Display) -> FetchError {
+    FetchError {
+        status: 502,
+        code: "upstream_unreachable",
+        message: "Upstream service unreachable".into(),
+        hint: Some(UPSTREAM_HINT.into()),
+        details: Some(json!({ "upstream": host, "reason": reason.to_string() })),
+    }
+}
+
+fn upstream_timed_out(host: &str, timeout: Duration) -> FetchError {
+    FetchError {
+        status: 504,
+        code: "upstream_timeout",
+        message: "Upstream service timed out".into(),
+        hint: Some(UPSTREAM_HINT.into()),
+        details: Some(json!({ "upstream": host, "timeoutMs": timeout.as_millis() as u64 })),
+    }
+}
+
+fn upstream_too_large(host: &str, max_bytes: usize) -> FetchError {
+    FetchError {
+        status: 502,
+        code: "upstream_too_large",
+        message: "Upstream response is too large".into(),
+        hint: Some(format!("The limit is {max_bytes} bytes.")),
+        details: Some(json!({ "upstream": host })),
+    }
+}
+
+const MAX_REDIRECTS: usize = 5;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct Egress {
+    tls: tokio_rustls::TlsConnector,
+    allow_private: bool,
+    max_bytes: usize,
+    timeout: Duration,
+}
+
+struct Target {
+    tls: bool,
+    host: String,
+    port: u16,
+    authority: String,
+}
+
 impl Egress {
-    pub fn new(allow_private: bool) -> Self {
+    pub fn for_extensions(allow_private: bool) -> Self {
+        Self::new(allow_private, 10 << 20, Duration::from_secs(10))
+    }
+
+    pub fn for_downloads() -> Self {
+        Self::new(true, 64 << 20, Duration::from_secs(120))
+    }
+
+    fn new(allow_private: bool, max_bytes: usize, timeout: Duration) -> Self {
         let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -137,193 +160,214 @@ impl Egress {
             .with_root_certificates(roots)
             .with_no_client_auth();
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self { tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)), allow_private, max_bytes: 10 << 20, timeout: Duration::from_secs(10) }
+        Self { tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)), allow_private, max_bytes, timeout }
     }
 
-    pub async fn fetch(&self, ext: &str, policy: &Policy, req: OutRequest) -> Result<OutResponse, WitError> {
-        let mut host_for_errors = String::new();
-        match tokio::time::timeout(self.timeout, self.fetch_inner(ext, policy, req, &mut host_for_errors)).await {
-            Ok(r) => r,
-            Err(_) => Err(api_error(504, "upstream_timeout", "Upstream service timed out", Some(UPSTREAM_HINT), Some(json!({ "upstream": host_for_errors, "timeoutMs": self.timeout.as_millis() as u64 })))),
-        }
-    }
-
-    async fn fetch_inner(&self, ext: &str, policy: &Policy, req: OutRequest, host_out: &mut String) -> Result<OutResponse, WitError> {
-        let OutRequest { mut method, url, headers, mut body } = req;
-        let mut uri: Uri = url.parse().map_err(|e| api_error(400, "bad_upstream_url", format!("Invalid URL {url:?}: {e}"), Some("Use an absolute http:// or https:// URL."), None))?;
-        for hop in 0..=MAX_REDIRECTS {
-            let tls = match uri.scheme_str() {
-                Some("https") => true,
-                Some("http") => false,
-                other => return Err(api_error(400, "bad_upstream_url", format!("Unsupported URL scheme {:?}", other.unwrap_or("")), Some("Only http: and https: are allowed."), None)),
-            };
-            let authority = uri.authority().ok_or_else(|| api_error(400, "bad_upstream_url", "The URL has no host", None, None))?.clone();
-            if authority.as_str().contains('@') {
-                return Err(api_error(400, "bad_upstream_url", "Credentials in URLs are not allowed", Some("Send them in a header instead."), None));
-            }
-            let host = authority.host().trim_start_matches('[').trim_end_matches(']').to_owned();
-            *host_out = host.clone();
-            let port = authority.port_u16().unwrap_or(if tls { 443 } else { 80 });
-
-            if !policy.allows(&host) {
-                let hint = match policy {
-                    Policy::None => format!("The extension declares no network access. Its author adds `.network([\"{host}\"])`, or the operator sets \"network\" for it in api.config.json."),
-                    _ => format!("Allowed hosts: {}. Add \"{host}\" to the extension's network list (or the operator's override in api.config.json).", policy.describe()),
-                };
-                return Err(api_error(403, "network_not_allowed", format!("The \"{ext}\" extension is not allowed to contact {host}"), Some(&hint), None));
-            }
-
-            let addrs = self.resolve(&host, port).await?;
-            let stream = connect_any(&addrs).await.map_err(|e| unreachable(&host, &e))?;
-
-            let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_owned();
-            let mut b = Request::builder().method(method.as_str()).uri(path).header("host", authority.as_str());
-            let mut has_ua = false;
-            for (k, v) in &headers {
-                let lk = k.to_ascii_lowercase();
-                if matches!(lk.as_str(), "host" | "connection" | "content-length" | "transfer-encoding" | "upgrade" | "te" | "proxy-authorization") {
-                    continue;
-                }
-                has_ua |= lk == "user-agent";
-                b = b.header(k.as_str(), v.as_str());
-            }
-            if !has_ua {
-                b = b.header("user-agent", format!("samishisa/{} ({ext})", env!("CARGO_PKG_VERSION")));
-            }
-            let request = b.body(Full::new(Bytes::from(body.clone().unwrap_or_default()))).map_err(|e| api_error(400, "bad_upstream_request", format!("Invalid request: {e}"), None, None))?;
-
-            let res = if tls {
-                let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| api_error(400, "bad_upstream_url", format!("Invalid TLS host name {host:?}"), None, None))?;
-                let tls_stream = self.tls.connect(name, stream).await.map_err(|e| unreachable(&host, &e))?;
-                send(tls_stream, request).await
-            } else {
-                send(stream, request).await
-            }
-            .map_err(|e| unreachable(&host, &e))?;
-
-            let status = res.status().as_u16();
-            if (300..400).contains(&status) {
-                if let Some(loc) = res.headers().get("location").and_then(|l| l.to_str().ok()) {
-                    if hop == MAX_REDIRECTS {
-                        return Err(api_error(502, "too_many_redirects", "Upstream redirected too many times", Some("Check the upstream URL."), Some(json!({ "upstream": host }))));
-                    }
-                    uri = join_location(&uri, loc).ok_or_else(|| api_error(502, "bad_redirect", "Upstream sent an invalid redirect", None, Some(json!({ "location": loc }))))?;
-                    if status == 303 || ((status == 301 || status == 302) && method == "POST") {
-                        method = "GET".into();
-                        body = None;
-                    }
-                    continue;
-                }
-            }
-            if let Some(len) = res.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok()) {
-                if len > self.max_bytes {
-                    return Err(too_large(&host, self.max_bytes));
-                }
-            }
-            let headers: Vec<(String, String)> = res.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned()))).collect();
-            let collected = Limited::new(res.into_body(), self.max_bytes).collect().await.map_err(|e| {
-                if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() { too_large(&host, self.max_bytes) } else { unreachable(&host, &*e) }
-            })?;
-            return Ok(OutResponse { status, headers, body: collected.to_bytes().to_vec() });
-        }
-        unreachable!("the loop returns on its last hop")
-    }
-
-    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, WitError> {
-        let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
-            Ok(ip) => vec![SocketAddr::new(ip, port)],
-            Err(_) => tokio::net::lookup_host((host, port))
+    pub async fn fetch(&self, ext: &str, policy: &Policy, request: OutRequest) -> Result<OutResponse, FetchError> {
+        let deadline = Instant::now() + self.timeout;
+        let OutRequest { mut method, url, headers, mut body } = request;
+        let mut uri: Uri = url.parse().map_err(|e| bad_url(format!("Invalid URL {url:?}: {e}"), Some("Use an absolute http:// or https:// URL.")))?;
+        let mut redirects = 0;
+        loop {
+            let target = Target::of(&uri)?;
+            check_allowed(ext, policy, &target.host)?;
+            let hop = build_request(&uri, &target, &method, &headers, body.clone(), ext)?;
+            let response = tokio::time::timeout_at(deadline, self.send(&target, hop))
                 .await
-                .map_err(|e| api_error(502, "upstream_unreachable", "Upstream host could not be resolved", Some(UPSTREAM_HINT), Some(json!({ "upstream": host, "reason": e.to_string() }))))?
-                .collect(),
+                .map_err(|_| upstream_timed_out(&target.host, self.timeout))??;
+
+            if let Some(next) = redirect_location(&uri, &response)? {
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(FetchError {
+                        status: 502,
+                        code: "too_many_redirects",
+                        message: "Upstream redirected too many times".into(),
+                        hint: Some("Check the upstream URL.".into()),
+                        details: Some(json!({ "upstream": target.host })),
+                    });
+                }
+                let status = response.status().as_u16();
+                if status == 303 || ((status == 301 || status == 302) && method == "POST") {
+                    method = "GET".into();
+                    body = None;
+                }
+                uri = next;
+                continue;
+            }
+            return tokio::time::timeout_at(deadline, self.read_body(&target.host, response))
+                .await
+                .map_err(|_| upstream_timed_out(&target.host, self.timeout))?;
+        }
+    }
+
+    async fn send(&self, target: &Target, request: Request<Full<Bytes>>) -> Result<hyper::Response<Incoming>, FetchError> {
+        let addresses = self.resolve_public(&target.host, target.port).await?;
+        let stream = connect_any(&addresses).await.map_err(|e| upstream_unreachable(&target.host, &e))?;
+        let sent = if target.tls {
+            let name = rustls::pki_types::ServerName::try_from(target.host.clone()).map_err(|_| bad_url(format!("Invalid TLS host name {:?}", target.host), None))?;
+            let tls_stream = self.tls.connect(name, stream).await.map_err(|e| upstream_unreachable(&target.host, &e))?;
+            send_http1(tls_stream, request).await
+        } else {
+            send_http1(stream, request).await
+        };
+        sent.map_err(|e| upstream_unreachable(&target.host, &e))
+    }
+
+    async fn resolve_public(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+        let addresses: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+            Ok(ip) => vec![SocketAddr::new(ip, port)],
+            Err(_) => tokio::net::lookup_host((host, port)).await.map_err(|e| upstream_unreachable(host, &e))?.collect(),
         };
         if !self.allow_private {
-            if let Some(bad) = addrs.iter().find(|a| is_private_ip(a.ip())) {
-                return Err(api_error(
-                    403,
-                    "network_private_blocked",
-                    format!("Requests to internal addresses are blocked ({host} is {})", bad.ip()),
-                    Some("Extensions may only reach public internet hosts. For local development the operator can set \"network\": { \"allowPrivate\": true }."),
-                    None,
-                ));
+            if let Some(private) = addresses.iter().find(|a| is_private_ip(a.ip())) {
+                return Err(FetchError {
+                    status: 403,
+                    code: "network_private_blocked",
+                    message: format!("Requests to internal addresses are blocked ({host} is {})", private.ip()),
+                    hint: Some("Extensions may only reach public internet hosts. For local development the operator can set \"network\": { \"allowPrivate\": true }.".into()),
+                    details: None,
+                });
             }
         }
-        if addrs.is_empty() {
-            return Err(api_error(502, "upstream_unreachable", "Upstream host has no addresses", Some(UPSTREAM_HINT), Some(json!({ "upstream": host }))));
+        if addresses.is_empty() {
+            return Err(upstream_unreachable(host, &"the host has no addresses"));
         }
-        Ok(addrs)
+        Ok(addresses)
+    }
+
+    async fn read_body(&self, host: &str, response: hyper::Response<Incoming>) -> Result<OutResponse, FetchError> {
+        let declared_length = response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok());
+        if declared_length.is_some_and(|len| len > self.max_bytes) {
+            return Err(upstream_too_large(host, self.max_bytes));
+        }
+        let status = response.status().as_u16();
+        let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned()))).collect();
+        let body = Limited::new(response.into_body(), self.max_bytes).collect().await.map_err(|e| {
+            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() { upstream_too_large(host, self.max_bytes) } else { upstream_unreachable(host, &*e) }
+        })?;
+        Ok(OutResponse { status, headers, body: body.to_bytes().to_vec() })
     }
 }
 
-async fn connect_any(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
-    let mut last = None;
-    for a in addrs {
-        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(a)).await {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                return Ok(s);
-            }
-            Ok(Err(e)) => last = Some(e),
-            Err(_) => last = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("connecting to {a} timed out"))),
+impl Target {
+    fn of(uri: &Uri) -> Result<Target, FetchError> {
+        let tls = match uri.scheme_str() {
+            Some("https") => true,
+            Some("http") => false,
+            other => return Err(bad_url(format!("Unsupported URL scheme {:?}", other.unwrap_or("")), Some("Only http: and https: are allowed."))),
+        };
+        let authority = uri.authority().ok_or_else(|| bad_url("The URL has no host", None))?;
+        if authority.as_str().contains('@') {
+            return Err(bad_url("Credentials in URLs are not allowed", Some("Send them in a header instead.")));
         }
+        Ok(Target {
+            tls,
+            host: authority.host().trim_start_matches('[').trim_end_matches(']').to_owned(),
+            port: authority.port_u16().unwrap_or(if tls { 443 } else { 80 }),
+            authority: authority.as_str().to_owned(),
+        })
     }
-    Err(last.unwrap_or_else(|| std::io::Error::other("no addresses")))
 }
 
-async fn send<S>(stream: S, req: Request<Full<Bytes>>) -> Result<hyper::Response<hyper::body::Incoming>, Box<dyn std::error::Error + Send + Sync>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    Ok(sender.send_request(req).await?)
+fn check_allowed(ext: &str, policy: &Policy, host: &str) -> Result<(), FetchError> {
+    if policy.allows(host) {
+        return Ok(());
+    }
+    let hint = match policy {
+        Policy::None => format!("The extension declares no network access. Its author adds `.network([\"{host}\"])`, or the operator sets \"network\" for it in api.config.json."),
+        _ => format!("Allowed hosts: {}. Add \"{host}\" to the extension's network list (or the operator's override in api.config.json).", policy.describe()),
+    };
+    Err(FetchError { status: 403, code: "network_not_allowed", message: format!("The \"{ext}\" extension is not allowed to contact {host}"), hint: Some(hint), details: None })
 }
 
-fn unreachable(host: &str, e: &dyn std::fmt::Display) -> WitError {
-    api_error(502, "upstream_unreachable", "Upstream service unreachable", Some(UPSTREAM_HINT), Some(json!({ "upstream": host, "reason": e.to_string() })))
+const HOP_HEADERS: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "upgrade", "te", "proxy-authorization"];
+
+fn build_request(uri: &Uri, target: &Target, method: &str, headers: &[(String, String)], body: Option<Vec<u8>>, ext: &str) -> Result<Request<Full<Bytes>>, FetchError> {
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let mut builder = Request::builder().method(method).uri(path).header("host", &target.authority);
+    let mut has_user_agent = false;
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if HOP_HEADERS.contains(&lower.as_str()) {
+            continue;
+        }
+        has_user_agent |= lower == "user-agent";
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if !has_user_agent {
+        builder = builder.header("user-agent", format!("samishisa/{} ({ext})", env!("CARGO_PKG_VERSION")));
+    }
+    builder.body(Full::new(Bytes::from(body.unwrap_or_default()))).map_err(|e| FetchError {
+        status: 400,
+        code: "bad_upstream_request",
+        message: format!("Invalid request: {e}"),
+        hint: None,
+        details: None,
+    })
 }
 
-fn too_large(host: &str, max: usize) -> WitError {
-    api_error(502, "upstream_too_large", "Upstream response is too large", Some(&format!("The limit is {max} bytes.")), Some(json!({ "upstream": host })))
+fn redirect_location(current: &Uri, response: &hyper::Response<Incoming>) -> Result<Option<Uri>, FetchError> {
+    if !response.status().is_redirection() {
+        return Ok(None);
+    }
+    let Some(location) = response.headers().get("location").and_then(|l| l.to_str().ok()) else { return Ok(None) };
+    join_location(current, location).map(Some).ok_or_else(|| FetchError {
+        status: 502,
+        code: "bad_redirect",
+        message: "Upstream sent an invalid redirect".into(),
+        hint: None,
+        details: Some(json!({ "location": location })),
+    })
 }
 
-fn join_location(base: &Uri, loc: &str) -> Option<Uri> {
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        return loc.parse().ok();
+fn join_location(base: &Uri, location: &str) -> Option<Uri> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.parse().ok();
     }
     let scheme = base.scheme_str()?;
     let authority = base.authority()?.as_str();
-    if let Some(rest) = loc.strip_prefix("//") {
+    if let Some(rest) = location.strip_prefix("//") {
         return format!("{scheme}://{rest}").parse().ok();
     }
-    let path = if loc.starts_with('/') {
-        loc.to_owned()
+    let path = if location.starts_with('/') {
+        location.to_owned()
     } else {
         let dir = base.path().rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        format!("{dir}/{loc}")
+        format!("{dir}/{location}")
     };
     format!("{scheme}://{authority}{path}").parse().ok()
+}
+
+async fn connect_any(addresses: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
+            Ok(Err(e)) => last_error = Some(e),
+            Err(_) => last_error = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("connecting to {address} timed out"))),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("no addresses")))
+}
+
+async fn send_http1<S>(stream: S, request: Request<Full<Bytes>>) -> Result<hyper::Response<Incoming>, hyper::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    sender.send_request(request).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn private_addresses() {
-        for s in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.16", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "::", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "64:ff9b::7f00:1", "2002:7f00:1::1"] {
-            assert!(is_private_ip(ip(s)), "{s} should be private");
-        }
-        for s in ["1.1.1.1", "8.8.8.8", "172.32.0.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"] {
-            assert!(!is_private_ip(ip(s)), "{s} should be public");
-        }
-    }
 
     #[test]
     fn allowlist() {
@@ -336,6 +380,15 @@ mod tests {
         assert!(!p.allows("example.com"));
         assert!(Policy::Any.allows("anything.org"));
         assert!(!Policy::None.allows("api.example.com"));
+    }
+
+    #[test]
+    fn policy_parse() {
+        let parse = |s: &str| serde_json::from_str::<Policy>(s);
+        assert_eq!(parse(r#""*""#).unwrap(), Policy::Any);
+        assert_eq!(parse(r#"["API.example.com"]"#).unwrap(), Policy::Hosts(vec!["api.example.com".into()]));
+        assert_eq!(parse("null").unwrap(), Policy::None);
+        assert!(parse(r#""example.com""#).is_err());
     }
 
     #[test]

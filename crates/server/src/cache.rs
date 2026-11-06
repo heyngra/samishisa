@@ -1,29 +1,35 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     hash::{Hash, Hasher},
-    io::Write,
     pin::Pin,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use bytes::Bytes;
+use http_body_util::Full;
+use hyper::Response;
+use serde::Deserialize;
 use tokio::sync::OnceCell;
 
-use crate::redis::RedisGuard;
+use crate::{
+    clock::now_ms,
+    compression::{Precompressed, gzip_if_worthwhile},
+    redis::RedisGuard,
+};
 
-pub const GZIP_MIN_BYTES: usize = 1024;
+const MAX_ENTRIES: usize = 5000;
+const REDIS_PREFIX: &str = "samishisa:rc:";
 
-#[derive(Debug)]
-pub struct Entry {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Bytes,
-    pub gz: Option<Bytes>,
-    pub etag: String,
-    pub fresh_until: u64,
-    pub usable_until: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct CacheRule {
+    #[serde(rename = "ttl")]
+    pub fresh_secs: u32,
+    #[serde(rename = "staleTtl", default)]
+    pub stale_secs: u32,
 }
 
 pub struct Produced {
@@ -32,187 +38,107 @@ pub struct Produced {
     pub body: Bytes,
 }
 
+impl Produced {
+    fn content_type(&self) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == "content-type").map(|(_, v)| v.as_str())
+    }
+}
+
 pub type Producer = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Produced> + Send>> + Send + Sync>;
 
+#[derive(Debug)]
+pub struct Entry {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+    gz: Option<Bytes>,
+    etag: String,
+    fresh_until: u64,
+    usable_until: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CacheState {
+    Hit,
+    Stale,
+    Miss,
+}
+
 pub enum Outcome {
-    Hit(Arc<Entry>),
-    Stale(Arc<Entry>),
-    Miss(Arc<Entry>),
+    Cached(Arc<Entry>, CacheState),
     Uncached(Produced),
 }
 
-pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-pub fn gzip(body: &[u8]) -> Option<Bytes> {
-    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(body.len() / 3), flate2::Compression::new(6));
-    enc.write_all(body).ok()?;
-    enc.finish().ok().map(Bytes::from)
-}
-
-pub fn etag(body: &[u8]) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut h);
-    format!("\"{:x}-{:x}\"", body.len(), h.finish())
-}
-
-fn make_entry(p: &Produced, ttl: u32, stale: u32, compress: bool) -> Entry {
-    let now = now_ms();
-    let compressible = p.headers.iter().any(|(k, v)| k == "content-type" && is_compressible(v));
-    Entry {
-        status: p.status,
-        headers: p.headers.clone(),
-        gz: if compress && compressible && p.body.len() >= GZIP_MIN_BYTES { gzip(&p.body) } else { None },
-        etag: etag(&p.body),
-        body: p.body.clone(),
-        fresh_until: now + ttl as u64 * 1000,
-        usable_until: now + (ttl as u64 + stale as u64) * 1000,
-    }
-}
-
-pub fn is_compressible(content_type: &str) -> bool {
-    let ct = content_type.to_ascii_lowercase();
-    ct.starts_with("text/") || ct.contains("json") || ct.contains("xml") || ct.contains("javascript")
-}
-
-type Flight = Arc<OnceCell<Option<Arc<Entry>>>>;
-
-pub struct ResponseCache {
-    map: Mutex<HashMap<String, (Arc<Entry>, u64)>>,
-    inflight: Mutex<HashMap<String, Flight>>,
-    refreshing: Mutex<std::collections::HashSet<String>>,
-    redis: Option<Arc<RedisGuard>>,
-    compress: bool,
-    max_entries: usize,
-    clock: std::sync::atomic::AtomicU64,
-}
-
-impl ResponseCache {
-    pub fn new(max_entries: usize, redis: Option<Arc<RedisGuard>>, compress: bool) -> Arc<Self> {
-        Arc::new(Self {
-            map: Mutex::default(),
-            inflight: Mutex::default(),
-            refreshing: Mutex::default(),
-            redis,
-            compress,
-            max_entries,
-            clock: Default::default(),
-        })
-    }
-
-    fn lookup(&self, key: &str) -> Option<Arc<Entry>> {
-        let tick = self.clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut map = self.map.lock().unwrap();
-        let slot = map.get_mut(key)?;
-        slot.1 = tick;
-        Some(slot.0.clone())
-    }
-
-    fn store(&self, key: &str, e: Arc<Entry>) {
-        let tick = self.clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut map = self.map.lock().unwrap();
-        map.insert(key.to_owned(), (e, tick));
-        if map.len() > self.max_entries {
-            let mut ticks: Vec<u64> = map.values().map(|(_, t)| *t).collect();
-            ticks.sort_unstable();
-            let cutoff = ticks[ticks.len() / 10];
-            let now = now_ms();
-            map.retain(|_, (e, t)| *t > cutoff && e.usable_until > now);
-        }
-    }
-
-    pub async fn get(self: &Arc<Self>, key: &str, ttl: u32, stale: u32, produce: Producer) -> Outcome {
+impl Entry {
+    fn new(produced: Produced, rule: CacheRule, gzip: bool) -> Entry {
         let now = now_ms();
-        if let Some(e) = self.lookup(key) {
-            if e.fresh_until > now {
-                return Outcome::Hit(e);
-            }
-            if e.usable_until > now {
-                self.refresh_in_background(key, ttl, stale, produce);
-                return Outcome::Stale(e);
-            }
+        let gz = if gzip { gzip_if_worthwhile(produced.content_type(), &produced.body) } else { None };
+        Entry {
+            etag: etag_of(&produced.body),
+            status: produced.status,
+            headers: produced.headers,
+            body: produced.body,
+            gz,
+            fresh_until: now + rule.fresh_secs as u64 * 1000,
+            usable_until: now + (rule.fresh_secs as u64 + rule.stale_secs as u64) * 1000,
         }
-        if let Some(r) = &self.redis {
-            if r.available() {
-                if let Some(e) = self.read_redis(r, key).await.filter(|e| e.usable_until > now) {
-                    let e = Arc::new(e);
-                    self.store(key, e.clone());
-                    if e.fresh_until <= now {
-                        self.refresh_in_background(key, ttl, stale, produce);
-                        return Outcome::Stale(e);
-                    }
-                    return Outcome::Hit(e);
-                }
-            }
-        }
-        let (flight, leader) = {
-            let mut inflight = self.inflight.lock().unwrap();
-            match inflight.get(key) {
-                Some(f) => (f.clone(), false),
-                None => {
-                    let f: Flight = Arc::new(OnceCell::new());
-                    inflight.insert(key.to_owned(), f.clone());
-                    (f, true)
-                }
-            }
+    }
+
+    pub fn to_response(&self, state: CacheState, rule: CacheRule, if_none_match: Option<&str>) -> Response<Full<Bytes>> {
+        let max_age = match state {
+            CacheState::Stale => 0,
+            _ => (self.fresh_until.saturating_sub(now_ms()) / 1000).min(rule.fresh_secs as u64),
         };
-        let mut uncached = None;
-        let slot = &mut uncached;
-        let leader_produce = produce.clone();
-        let entry = flight
-            .get_or_init(move || async move {
-                let p = leader_produce().await;
-                if p.status != 200 {
-                    *slot = Some(p);
-                    return None;
-                }
-                let e = Arc::new(make_entry(&p, ttl, stale, self.compress));
-                self.store(key, e.clone());
-                self.write_redis(key, &e);
-                Some(e)
-            })
-            .await
-            .clone();
-        if leader {
-            self.inflight.lock().unwrap().remove(key);
+        let cache_control = match rule.stale_secs {
+            0 => format!("public, max-age={max_age}"),
+            stale => format!("public, max-age={max_age}, stale-while-revalidate={stale}"),
+        };
+        let x_cache = match state {
+            CacheState::Hit => "HIT",
+            CacheState::Stale => "STALE",
+            CacheState::Miss => "MISS",
+        };
+        let not_modified = if_none_match.is_some_and(|v| v.split(',').any(|tag| tag.trim() == self.etag || tag.trim() == "*"));
+        let mut builder = Response::builder()
+            .status(if not_modified { 304 } else { self.status })
+            .header("etag", &self.etag)
+            .header("cache-control", cache_control)
+            .header("x-cache", x_cache);
+        if not_modified {
+            return builder.body(Full::new(Bytes::new())).expect("valid response");
         }
-        match (entry, uncached) {
-            (Some(e), _) => Outcome::Miss(e),
-            (None, Some(p)) => Outcome::Uncached(p),
-            (None, None) => Outcome::Uncached(produce().await),
+        for (k, v) in &self.headers {
+            builder = builder.header(k, v);
         }
+        let mut response = builder.body(Full::new(self.body.clone())).expect("valid response");
+        if let Some(gz) = &self.gz {
+            response.extensions_mut().insert(Precompressed(gz.clone()));
+        }
+        response
     }
 
-    fn refresh_in_background(self: &Arc<Self>, key: &str, ttl: u32, stale: u32, produce: Producer) {
-        if !self.refreshing.lock().unwrap().insert(key.to_owned()) {
-            return;
-        }
-        let me = self.clone();
-        let key = key.to_owned();
-        tokio::spawn(async move {
-            let p = produce().await;
-            if p.status == 200 {
-                let e = Arc::new(make_entry(&p, ttl, stale, me.compress));
-                me.store(&key, e.clone());
-                me.write_redis(&key, &e);
-            }
-            me.refreshing.lock().unwrap().remove(&key);
-        });
+    fn to_redis_bytes(&self) -> Vec<u8> {
+        let head = serde_json::json!({ "status": self.status, "headers": self.headers, "etag": self.etag, "fresh": self.fresh_until, "usable": self.usable_until }).to_string();
+        let mut bytes = Vec::with_capacity(4 + head.len() + self.body.len());
+        bytes.extend_from_slice(&(head.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(head.as_bytes());
+        bytes.extend_from_slice(&self.body);
+        bytes
     }
 
-    async fn read_redis(&self, r: &RedisGuard, key: &str) -> Option<Entry> {
-        let k = format!("samishisa:rc:{key}");
-        let raw: Option<Vec<u8>> = r.run(|mut c| async move { redis::cmd("GET").arg(&k).query_async(&mut c).await }).await.ok()?;
-        let raw = raw?;
-        let len = u32::from_le_bytes(raw.get(..4)?.try_into().ok()?) as usize;
-        let head: serde_json::Value = serde_json::from_slice(raw.get(4..4 + len)?).ok()?;
-        let body = Bytes::copy_from_slice(raw.get(4 + len..)?);
-        let headers = head["headers"].as_array()?.iter().filter_map(|h| Some((h[0].as_str()?.to_owned(), h[1].as_str()?.to_owned()))).collect::<Vec<_>>();
-        let compressible = headers.iter().any(|(k, v)| k == "content-type" && is_compressible(v));
+    fn from_redis_bytes(raw: &[u8], gzip: bool) -> Option<Entry> {
+        let head_len = u32::from_le_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+        let head: serde_json::Value = serde_json::from_slice(raw.get(4..4 + head_len)?).ok()?;
+        let body = Bytes::copy_from_slice(raw.get(4 + head_len..)?);
+        let headers: Vec<(String, String)> = head["headers"]
+            .as_array()?
+            .iter()
+            .filter_map(|h| Some((h[0].as_str()?.to_owned(), h[1].as_str()?.to_owned())))
+            .collect();
+        let content_type = headers.iter().find(|(k, _)| k == "content-type").map(|(_, v)| v.as_str());
         Some(Entry {
             status: head["status"].as_u64()? as u16,
-            gz: if self.compress && compressible && body.len() >= GZIP_MIN_BYTES { gzip(&body) } else { None },
+            gz: if gzip { gzip_if_worthwhile(content_type, &body) } else { None },
             etag: head["etag"].as_str()?.to_owned(),
             fresh_until: head["fresh"].as_u64()?,
             usable_until: head["usable"].as_u64()?,
@@ -220,21 +146,154 @@ impl ResponseCache {
             body,
         })
     }
+}
 
-    fn write_redis(&self, key: &str, e: &Entry) {
-        let Some(r) = self.redis.clone() else { return };
-        if !r.available() {
+fn etag_of(body: &[u8]) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut h);
+    format!("\"{:x}-{:x}\"", body.len(), h.finish())
+}
+
+type Flight = Arc<OnceCell<Option<Arc<Entry>>>>;
+
+enum Filled {
+    Cached(Arc<Entry>),
+    NotCacheable(Produced),
+}
+
+pub struct ResponseCache {
+    entries: Mutex<HashMap<String, (Arc<Entry>, u64)>>,
+    use_counter: AtomicU64,
+    in_flight: Mutex<HashMap<String, Flight>>,
+    refreshing: Mutex<HashSet<String>>,
+    redis: Option<Arc<RedisGuard>>,
+    gzip: bool,
+}
+
+impl ResponseCache {
+    pub fn new(redis: Option<Arc<RedisGuard>>, gzip: bool) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::default(),
+            use_counter: AtomicU64::new(0),
+            in_flight: Mutex::default(),
+            refreshing: Mutex::default(),
+            redis,
+            gzip,
+        })
+    }
+
+    pub async fn get(self: &Arc<Self>, key: &str, rule: CacheRule, produce: Producer) -> Outcome {
+        let now = now_ms();
+        let existing = match self.from_memory(key, now) {
+            Some(entry) => Some(entry),
+            None => self.from_redis(key, now).await,
+        };
+        match existing {
+            Some(entry) if entry.fresh_until > now => Outcome::Cached(entry, CacheState::Hit),
+            Some(entry) => {
+                self.refresh_in_background(key, rule, produce);
+                Outcome::Cached(entry, CacheState::Stale)
+            }
+            None => self.produce_once(key, rule, produce).await,
+        }
+    }
+
+    async fn produce_once(self: &Arc<Self>, key: &str, rule: CacheRule, produce: Producer) -> Outcome {
+        let (flight, is_leader) = {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            match in_flight.get(key) {
+                Some(flight) => (flight.clone(), false),
+                None => {
+                    let flight: Flight = Arc::default();
+                    in_flight.insert(key.to_owned(), flight.clone());
+                    (flight, true)
+                }
+            }
+        };
+        let mut not_cacheable = None;
+        let leaders_answer = &mut not_cacheable;
+        let leader_produce = produce.clone();
+        let entry = flight
+            .get_or_init(move || async move {
+                match self.fill(key, leader_produce().await, rule) {
+                    Filled::Cached(entry) => Some(entry),
+                    Filled::NotCacheable(produced) => {
+                        *leaders_answer = Some(produced);
+                        None
+                    }
+                }
+            })
+            .await
+            .clone();
+        if is_leader {
+            self.in_flight.lock().unwrap().remove(key);
+        }
+        match (entry, not_cacheable) {
+            (Some(entry), _) => Outcome::Cached(entry, CacheState::Miss),
+            (None, Some(produced)) => Outcome::Uncached(produced),
+            (None, None) => Outcome::Uncached(produce().await),
+        }
+    }
+
+    fn refresh_in_background(self: &Arc<Self>, key: &str, rule: CacheRule, produce: Producer) {
+        if !self.refreshing.lock().unwrap().insert(key.to_owned()) {
             return;
         }
-        let head = serde_json::json!({ "status": e.status, "headers": e.headers, "etag": e.etag, "fresh": e.fresh_until, "usable": e.usable_until }).to_string();
-        let mut buf = Vec::with_capacity(4 + head.len() + e.body.len());
-        buf.extend_from_slice(&(head.len() as u32).to_le_bytes());
-        buf.extend_from_slice(head.as_bytes());
-        buf.extend_from_slice(&e.body);
-        let ttl_ms = e.usable_until.saturating_sub(now_ms()).max(1);
-        let k = format!("samishisa:rc:{key}");
+        let cache = self.clone();
+        let key = key.to_owned();
         tokio::spawn(async move {
-            let _ = r.run(|mut c| async move { redis::cmd("SET").arg(&k).arg(buf).arg("PX").arg(ttl_ms).query_async::<()>(&mut c).await }).await;
+            cache.fill(&key, produce().await, rule);
+            cache.refreshing.lock().unwrap().remove(&key);
+        });
+    }
+
+    fn fill(&self, key: &str, produced: Produced, rule: CacheRule) -> Filled {
+        if produced.status != 200 {
+            return Filled::NotCacheable(produced);
+        }
+        let entry = Arc::new(Entry::new(produced, rule, self.gzip));
+        self.remember(key, entry.clone());
+        self.write_redis(key, &entry);
+        Filled::Cached(entry)
+    }
+
+    fn from_memory(&self, key: &str, now: u64) -> Option<Arc<Entry>> {
+        let used = self.use_counter.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        let (entry, last_used) = entries.get_mut(key)?;
+        *last_used = used;
+        (entry.usable_until > now).then(|| entry.clone())
+    }
+
+    fn remember(&self, key: &str, entry: Arc<Entry>) {
+        let used = self.use_counter.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        entries.insert(key.to_owned(), (entry, used));
+        if entries.len() > MAX_ENTRIES {
+            let mut uses: Vec<u64> = entries.values().map(|(_, used)| *used).collect();
+            uses.sort_unstable();
+            let cutoff = uses[uses.len() / 10];
+            let now = now_ms();
+            entries.retain(|_, (entry, used)| *used > cutoff && entry.usable_until > now);
+        }
+    }
+
+    async fn from_redis(&self, key: &str, now: u64) -> Option<Arc<Entry>> {
+        let redis = self.redis.as_ref().filter(|r| r.available())?;
+        let redis_key = format!("{REDIS_PREFIX}{key}");
+        let raw: Option<Vec<u8>> = redis.run(|mut c| async move { redis::cmd("GET").arg(&redis_key).query_async(&mut c).await }).await.ok()?;
+        let entry = Arc::new(Entry::from_redis_bytes(&raw?, self.gzip).filter(|e| e.usable_until > now)?);
+        self.remember(key, entry.clone());
+        Some(entry)
+    }
+
+    fn write_redis(&self, key: &str, entry: &Entry) {
+        let Some(redis) = self.redis.clone().filter(|r| r.available()) else { return };
+        let bytes = entry.to_redis_bytes();
+        let ttl_ms = entry.usable_until.saturating_sub(now_ms()).max(1);
+        let redis_key = format!("{REDIS_PREFIX}{key}");
+        tokio::spawn(async move {
+            let _ = redis.run(|mut c| async move { redis::cmd("SET").arg(&redis_key).arg(bytes).arg("PX").arg(ttl_ms).query_async::<()>(&mut c).await }).await;
         });
     }
 }
@@ -242,7 +301,9 @@ impl ResponseCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+
+    const RULE: CacheRule = CacheRule { fresh_secs: 60, stale_secs: 0 };
 
     fn producer(calls: Arc<AtomicUsize>, status: u16) -> Producer {
         Arc::new(move || {
@@ -255,24 +316,31 @@ mod tests {
         })
     }
 
+    fn state(outcome: &Outcome) -> Option<CacheState> {
+        match outcome {
+            Outcome::Cached(_, state) => Some(*state),
+            Outcome::Uncached(_) => None,
+        }
+    }
+
     #[tokio::test]
     async fn single_flight_and_hits() {
-        let cache = ResponseCache::new(100, None, true);
+        let cache = ResponseCache::new(None, true);
         let calls = Arc::new(AtomicUsize::new(0));
         let p = producer(calls.clone(), 200);
-        let (a, b) = tokio::join!(cache.get("k", 60, 0, p.clone()), cache.get("k", 60, 0, p.clone()));
-        assert!(matches!(a, Outcome::Miss(_)) && matches!(b, Outcome::Miss(_)));
+        let (a, b) = tokio::join!(cache.get("k", RULE, p.clone()), cache.get("k", RULE, p.clone()));
+        assert_eq!((state(&a), state(&b)), (Some(CacheState::Miss), Some(CacheState::Miss)));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "concurrent misses share one call");
-        assert!(matches!(cache.get("k", 60, 0, p).await, Outcome::Hit(_)));
+        assert_eq!(state(&cache.get("k", RULE, p).await), Some(CacheState::Hit));
     }
 
     #[tokio::test]
     async fn errors_are_not_cached() {
-        let cache = ResponseCache::new(100, None, true);
+        let cache = ResponseCache::new(None, true);
         let calls = Arc::new(AtomicUsize::new(0));
         let p = producer(calls.clone(), 500);
-        assert!(matches!(cache.get("k", 60, 0, p.clone()).await, Outcome::Uncached(_)));
-        assert!(matches!(cache.get("k", 60, 0, p).await, Outcome::Uncached(_)));
+        assert_eq!(state(&cache.get("k", RULE, p.clone()).await), None);
+        assert_eq!(state(&cache.get("k", RULE, p).await), None);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

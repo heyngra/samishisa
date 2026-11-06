@@ -1,18 +1,28 @@
 use std::{
-    path::Path,
-    sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::{clock, log::log_error};
 
 pub struct Store {
     conn: Mutex<Connection>,
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    clock::now_ms() as i64
+}
+
+fn or_log<T>(operation: &str, key: &str, result: rusqlite::Result<T>, fallback: T) -> T {
+    result.unwrap_or_else(|e| {
+        log_error!("store", "{operation} {key:?}: {e}");
+        fallback
+    })
 }
 
 impl Store {
@@ -37,62 +47,95 @@ impl Store {
 
     pub fn get(&self, key: &str) -> Option<String> {
         let c = self.conn.lock().unwrap();
-        c.prepare_cached("SELECT value FROM kv WHERE key = ?1 AND (expires IS NULL OR expires >= ?2)")
-            .and_then(|mut s| s.query_row(params![key, now_ms()], |r| r.get(0)).optional())
-            .unwrap_or_else(|e| {
-                crate::log::write(crate::log::Level::Error, "store", &format!("get {key:?}: {e}"));
-                None
-            })
+        let result = c
+            .prepare_cached("SELECT value FROM kv WHERE key = ?1 AND (expires IS NULL OR expires >= ?2)")
+            .and_then(|mut s| s.query_row(params![key, now_ms()], |r| r.get(0)).optional());
+        or_log("get", key, result, None)
     }
 
     pub fn set(&self, key: &str, value: &str, ttl: Option<Duration>) {
         let expires = ttl.map(|t| now_ms() + t.as_millis() as i64);
         let c = self.conn.lock().unwrap();
-        if let Err(e) = c.prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)").and_then(|mut s| s.execute(params![key, value, expires])) {
-            crate::log::write(crate::log::Level::Error, "store", &format!("set {key:?}: {e}"));
-        }
+        let result = c
+            .prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)")
+            .and_then(|mut s| s.execute(params![key, value, expires]));
+        or_log("set", key, result.map(drop), ());
     }
 
     pub fn delete(&self, key: &str) {
         let c = self.conn.lock().unwrap();
-        let _ = c.prepare_cached("DELETE FROM kv WHERE key = ?1").and_then(|mut s| s.execute(params![key]));
+        let result = c.prepare_cached("DELETE FROM kv WHERE key = ?1").and_then(|mut s| s.execute(params![key]));
+        or_log("delete", key, result.map(drop), ());
     }
 
     pub fn incr(&self, key: &str, by: i64) -> i64 {
         let mut c = self.conn.lock().unwrap();
-        let run = |c: &mut Connection| -> rusqlite::Result<i64> {
+        let result = (|| -> rusqlite::Result<i64> {
             let tx = c.transaction()?;
             let row: Option<(String, Option<i64>)> = tx
                 .prepare_cached("SELECT value, expires FROM kv WHERE key = ?1")?
                 .query_row(params![key], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            let now = now_ms();
             let (current, expires) = match row {
-                Some((v, exp)) if exp.is_none_or(|e| e >= now) => (v.trim().parse::<i64>().unwrap_or(0), exp),
+                Some((value, expires)) if expires.is_none_or(|e| e >= now_ms()) => (value.trim().parse::<i64>().unwrap_or(0), expires),
                 _ => (0, None),
             };
             let next = current.saturating_add(by);
-            tx.prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)")?.execute(params![key, next.to_string(), expires])?;
+            tx.prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)")?
+                .execute(params![key, next.to_string(), expires])?;
             tx.commit()?;
             Ok(next)
-        };
-        run(&mut c).unwrap_or_else(|e| {
-            crate::log::write(crate::log::Level::Error, "store", &format!("incr {key:?}: {e}"));
-            0
-        })
+        })();
+        or_log("incr", key, result, 0)
     }
 
     pub fn keys(&self, prefix: &str) -> Vec<String> {
         let c = self.conn.lock().unwrap();
-        let r = c.prepare_cached("SELECT key FROM kv WHERE substr(key, 1, ?1) = ?2 AND (expires IS NULL OR expires >= ?3) ORDER BY key").and_then(|mut s| {
-            s.query_map(params![prefix.chars().count() as i64, prefix, now_ms()], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()
-        });
-        r.unwrap_or_default()
+        let result = c
+            .prepare_cached("SELECT key FROM kv WHERE substr(key, 1, ?1) = ?2 AND (expires IS NULL OR expires >= ?3) ORDER BY key")
+            .and_then(|mut s| {
+                s.query_map(params![prefix.chars().count() as i64, prefix, now_ms()], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        or_log("keys", prefix, result, Vec::new())
     }
 
-    pub fn prune(&self) {
+    pub fn delete_expired(&self) {
         let c = self.conn.lock().unwrap();
-        let _ = c.execute("DELETE FROM kv WHERE expires IS NOT NULL AND expires < ?1", params![now_ms()]);
+        let result = c.execute("DELETE FROM kv WHERE expires IS NOT NULL AND expires < ?1", params![now_ms()]);
+        or_log("delete expired", "", result.map(drop), ());
+    }
+}
+
+#[derive(Default)]
+pub struct Stores {
+    open: Mutex<HashMap<PathBuf, Arc<Store>>>,
+}
+
+impl Stores {
+    pub fn open(&self, data_dir: &Path, extension: &str) -> anyhow::Result<Arc<Store>> {
+        let path = data_dir.join("ext").join(extension).join("store.db");
+        let mut open = self.open.lock().unwrap();
+        if let Some(store) = open.get(&path) {
+            return Ok(store.clone());
+        }
+        let store = Arc::new(Store::open(Some(&path))?);
+        open.insert(path, store.clone());
+        Ok(store)
+    }
+
+    pub fn delete_expired_every_minute(self: &Arc<Self>) {
+        let stores = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let all: Vec<Arc<Store>> = stores.open.lock().unwrap().values().cloned().collect();
+                for store in all {
+                    store.delete_expired();
+                }
+            }
+        });
     }
 }
 
@@ -103,7 +146,8 @@ mod tests {
     #[test]
     fn roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(Some(&dir.path().join("ext/x/store.db"))).unwrap();
+        let stores = Stores::default();
+        let s = stores.open(dir.path(), "x").unwrap();
         assert_eq!(s.get("a"), None);
         s.set("a", "1", None);
         assert_eq!(s.get("a").as_deref(), Some("1"));
@@ -116,7 +160,8 @@ mod tests {
         assert_eq!(s.incr("b:2", 1), 1, "an expired counter restarts at 0");
         s.delete("a");
         assert_eq!(s.get("a"), None);
-        drop(s);
+        assert!(Arc::ptr_eq(&s, &stores.open(dir.path(), "x").unwrap()), "one store per extension");
+        drop((s, stores));
         let again = Store::open(Some(&dir.path().join("ext/x/store.db"))).unwrap();
         assert_eq!(again.get("b:1").as_deref(), Some("\"x\""), "data survives reopening");
     }

@@ -39,8 +39,7 @@ pub struct RateLimit {
 
 impl RateLimit {
     pub fn new(limit: u32, window: Duration) -> Self {
-        let secs = window.as_secs() + u64::from(window.subsec_nanos() > 0);
-        Self { limit, window_sec: secs.clamp(1, u32::MAX as u64) as u32, global: false }
+        Self { limit, window_sec: whole_seconds(window), global: false }
     }
     pub fn per_second(limit: u32) -> Self {
         Self::new(limit, Duration::from_secs(1))
@@ -61,6 +60,24 @@ impl RateLimit {
     }
 }
 
+pub(crate) fn whole_seconds(duration: Duration) -> u32 {
+    let secs = duration.as_secs() + u64::from(duration.subsec_nanos() > 0);
+    secs.clamp(1, u32::MAX as u64) as u32
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RouteRateLimit {
+    Inherit,
+    Own(RateLimit),
+    Off,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CacheRule {
+    ttl_secs: u32,
+    stale_secs: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct RouteSpec {
     method: Method,
@@ -71,8 +88,8 @@ pub struct RouteSpec {
     query: Option<Value>,
     body: Option<Value>,
     response: Option<Value>,
-    cache: Option<(u32, u32)>,
-    rate_limit: Option<Option<RateLimit>>,
+    cache: Option<CacheRule>,
+    rate_limit: RouteRateLimit,
     timeout_ms: Option<u64>,
     pub(crate) errors: Vec<String>,
 }
@@ -81,7 +98,7 @@ impl RouteSpec {
     fn new(method: Method, path: &str) -> Self {
         Self {
             method, path: path.to_owned(), summary: None, description: None, params: None, query: None, body: None,
-            response: None, cache: None, rate_limit: None, timeout_ms: None, errors: Vec::new(),
+            response: None, cache: None, rate_limit: RouteRateLimit::Inherit, timeout_ms: None, errors: Vec::new(),
         }
     }
     pub fn method(&self) -> Method {
@@ -123,8 +140,12 @@ impl RouteSpec {
         put("query", self.query.clone());
         put("body", self.body.clone());
         put("response", self.response.clone());
-        put("cache", self.cache.map(|(ttl, stale)| json!({ "ttl": ttl, "staleTtl": stale })));
-        put("rateLimit", self.rate_limit.map(|r| r.map_or(Value::Bool(false), RateLimit::to_json)));
+        put("cache", self.cache.map(|c| json!({ "ttl": c.ttl_secs, "staleTtl": c.stale_secs })));
+        put("rateLimit", match self.rate_limit {
+            RouteRateLimit::Inherit => None,
+            RouteRateLimit::Own(limit) => Some(limit.to_json()),
+            RouteRateLimit::Off => Some(Value::Bool(false)),
+        });
         put("timeoutMs", self.timeout_ms.map(Value::from));
         v
     }
@@ -279,21 +300,21 @@ impl<C: Config> Extension<C> {
                 let msg = format!("{} {}: only GET routes can be cached", r.method.as_str(), r.path);
                 r.error(msg);
             }
-            r.cache = Some((ttl_secs, stale_secs));
+            r.cache = Some(CacheRule { ttl_secs, stale_secs });
         }
         self
     }
 
     pub fn rate_limit(mut self, limit: RateLimit) -> Self {
         if let Some(r) = self.last("rate_limit") {
-            r.rate_limit = Some(Some(limit));
+            r.rate_limit = RouteRateLimit::Own(limit);
         }
         self
     }
 
     pub fn no_rate_limit(mut self) -> Self {
         if let Some(r) = self.last("no_rate_limit") {
-            r.rate_limit = Some(None);
+            r.rate_limit = RouteRateLimit::Off;
         }
         self
     }
@@ -315,14 +336,15 @@ fn same_shape(a: &str, b: &str) -> bool {
 
 pub(crate) fn schema_of<T: JsonSchema>() -> Value {
     let generator = schemars::generate::SchemaSettings::draft2020_12().into_generator();
-    let mut v = serde_json::to_value(generator.into_root_schema_for::<T>()).unwrap_or(Value::Bool(true));
-    if let Value::Object(o) = &mut v {
+    let mut schema = serde_json::to_value(generator.into_root_schema_for::<T>()).unwrap_or(Value::Bool(true));
+    let title_says_something = is_object_schema(&schema) || schema.get("enum").is_some() || schema.get("oneOf").is_some();
+    if let Value::Object(o) = &mut schema {
         o.remove("$schema");
-        if !is_object_schema(&Value::Object(o.clone())) && o.get("enum").is_none() && o.get("oneOf").is_none() {
+        if !title_says_something {
             o.remove("title");
         }
     }
-    v
+    schema
 }
 
 pub(crate) fn config_schema_of<T: JsonSchema>() -> Value {

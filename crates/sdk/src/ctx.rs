@@ -2,7 +2,7 @@ use std::{fmt::Display, rc::Rc, time::Duration};
 
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{ApiError, Result, __bindings::samishisa::extension::host};
+use crate::{ApiError, Result, __bindings::samishisa::extension::host, extension::whole_seconds};
 
 #[derive(Debug, Default, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -53,8 +53,7 @@ impl Store {
     }
 
     pub fn set_for<T: Serialize + ?Sized>(&self, key: &str, value: &T, ttl: Duration) -> Result<()> {
-        let secs = ttl.as_secs() + u64::from(ttl.subsec_nanos() > 0);
-        host::store_set(key, &serde_json::to_string(value)?, Some(secs.clamp(1, u32::MAX as u64) as u32));
+        host::store_set(key, &serde_json::to_string(value)?, Some(whole_seconds(ttl)));
         Ok(())
     }
 
