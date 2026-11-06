@@ -69,13 +69,8 @@ impl Route {
 }
 
 pub enum Match<'r, 'p> {
-    Found {
-        route: &'r Route,
-        params: Vec<(&'r str, &'p str)>,
-    },
-    WrongMethod {
-        allowed: Vec<&'r str>,
-    },
+    Found { route: &'r Route, params: Vec<(&'r str, &'p str)> },
+    WrongMethod { allowed: Vec<&'r str> },
     NotFound,
 }
 

@@ -56,12 +56,7 @@ impl ResourceLimiter for MemoryCap {
 }
 
 pub(super) fn new_store(engine: &Engine, shared: Arc<Shared>, deadline: Duration, max_memory_bytes: usize) -> Store<State> {
-    let state = State {
-        wasi: WasiCtx::builder().build(),
-        table: ResourceTable::new(),
-        memory: MemoryCap { max_bytes: max_memory_bytes, was_hit: false },
-        shared,
-    };
+    let state = State { wasi: WasiCtx::builder().build(), table: ResourceTable::new(), memory: MemoryCap { max_bytes: max_memory_bytes, was_hit: false }, shared };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.memory);
     store.set_epoch_deadline(ticks(deadline));

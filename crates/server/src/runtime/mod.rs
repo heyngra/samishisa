@@ -171,9 +171,7 @@ fn cache_key(engine: &Engine, wasm: &[u8]) -> String {
 fn new_engine(pool_slots: Option<u32>, max_memory_mb: u32) -> anyhow::Result<Engine> {
     let memory = megabytes(max_memory_mb);
     let mut cfg = WasmConfig::new();
-    cfg.epoch_interruption(true)
-        .memory_reservation(u64::try_from(memory).unwrap_or(u64::MAX))
-        .memory_guard_size(64 << 10);
+    cfg.epoch_interruption(true).memory_reservation(u64::try_from(memory).unwrap_or(u64::MAX)).memory_guard_size(64 << 10);
     if let Some(n) = pool_slots {
         let mut pool = PoolingAllocationConfig::default();
         pool.total_component_instances(n).total_core_instances(n * 4).total_memories(n).total_tables(n * 4).total_stacks(n).max_memory_size(memory);
