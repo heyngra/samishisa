@@ -1,18 +1,22 @@
 use serde_json::{Value, json};
 
-use super::{Failed, Mounted, input::{primary_type, resolve_ref}};
+use super::{
+    Failed, Mounted,
+    input::{primary_type, resolve_ref},
+};
 use crate::manifest::RouteManifest;
 
-pub fn index(title: &str, mounted: &[Mounted], failed: &[Failed]) -> Value {
+pub fn index(title: &str, docs: bool, mounted: &[Mounted], failed: &[Failed]) -> Value {
     json!({
         "name": title,
         "version": env!("CARGO_PKG_VERSION"),
-        "docs": "/docs",
+        "docs": docs.then_some("/docs"),
         "openapi": "/openapi.json",
         "extensions": mounted.iter().map(|m| json!({
             "name": m.runner.mount,
             "version": m.runner.manifest.version,
             "description": m.runner.manifest.description,
+            "openapi": format!("/openapi/{}.json", m.runner.mount),
             "network": m.runner.policy().describe(),
             "routes": m.routes.iter().map(|r| r.usage.clone()).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
@@ -27,6 +31,7 @@ pub fn extension(m: &Mounted) -> Value {
         "version": manifest.version,
         "description": manifest.description,
         "sdk": manifest.sdk,
+        "openapi": format!("/openapi/{}.json", m.runner.mount),
         "network": m.runner.policy().describe(),
         "routes": m.routes.iter().map(|route| {
             let spec = &route.spec;

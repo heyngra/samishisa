@@ -1,5 +1,21 @@
 use crate::{FromRequest, IntoResponse, RequestParts, Response, Result, extension::RouteSpec};
 
+/// A function that can serve a route: up to 8 [`FromRequest`] arguments in any order, returning anything [`IntoResponse`]. The impl is automatic for such functions and closures.
+///
+/// ```no_run
+/// use samishisa::prelude::*;
+/// fn ping() -> &'static str { "pong" }
+/// fn whoami(headers: Headers) -> String { headers.get("user-agent").unwrap_or("?").to_owned() }
+/// fn count(ctx: Ctx) -> Json<i64> { Json(ctx.store.incr("count", 1)) }
+///
+/// let ext = Extension::new("demo")
+///     .get("/ping", ping)
+///     .get("/whoami", whoami)
+///     .post("/count", count)
+///     .get("/inline", |ctx: Ctx| format!("{:?}", ctx.request_id()));
+/// ```
+///
+/// If the compiler says a function "is not a handler", one of its arguments isn't an extractor, or its return type isn't `IntoResponse`. Closures need their argument types written out.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a samishisa handler",
     note = "handlers take up to 8 extractor arguments (Path, Query, Json, Headers, Ctx<YourConfig>) and return something IntoResponse (Json, Response, String, (), Result<_, ApiError>)",

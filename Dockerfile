@@ -1,3 +1,8 @@
+# Builds samishisa from source into a small image. Releases also publish a ready-made image: ghcr.io/heyngra/samishisa.
+# The build compiles wasmtime, so expect several minutes and about 2 GB of RAM.
+#
+#   docker build -t samishisa .
+#   docker run -p 3000:3000 -v ./config:/config -v samishisa-data:/data samishisa
 FROM rust:1-bookworm AS build
 RUN rustup target add wasm32-wasip2
 WORKDIR /src
@@ -16,4 +21,4 @@ VOLUME ["/config", "/data"]
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["samishisa", "healthcheck"]
 ENTRYPOINT ["samishisa"]
-CMD ["serve"]
+CMD ["run"]

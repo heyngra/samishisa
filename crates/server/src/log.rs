@@ -2,12 +2,12 @@ use std::{
     io::Write,
     sync::{
         Mutex, Once,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
 
-use crate::clock::utc_timestamp;
+use crate::{clock::utc_timestamp, sync::lock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -15,6 +15,7 @@ pub enum Level {
     Info = 1,
     Warn = 2,
     Error = 3,
+    Off = 4,
 }
 
 static MIN_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
@@ -42,6 +43,7 @@ pub fn write(level: Level, target: &str, message: &str) {
         Level::Info => "INFO ",
         Level::Warn => "WARN ",
         Level::Error => "ERROR",
+        Level::Off => return,
     };
     eprintln!("{} {tag} [{target}] {message}", utc_timestamp());
 }
@@ -49,29 +51,37 @@ pub fn write(level: Level, target: &str, message: &str) {
 const ACCESS_QUEUE_LIMIT: usize = 8 << 20;
 static ACCESS_QUEUE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static ACCESS_WRITER: Once = Once::new();
+static ACCESS_WRITER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub fn access(line: String) {
     ACCESS_WRITER.call_once(|| {
-        std::thread::Builder::new()
-            .name("access-log".into())
-            .spawn(|| loop {
+        let started = std::thread::Builder::new().name("access-log".into()).spawn(|| {
+            loop {
                 std::thread::sleep(Duration::from_millis(200));
                 flush();
-            })
-            .expect("spawning the access-log thread");
+            }
+        });
+        match started {
+            Ok(_) => ACCESS_WRITER_RUNNING.store(true, Ordering::Relaxed),
+            Err(e) => write(Level::Warn, "core", &format!("no access-log thread ({e}); writing access lines directly")),
+        }
     });
     let stamp = utc_timestamp();
-    let mut queue = ACCESS_QUEUE.lock().unwrap();
+    let mut queue = lock(&ACCESS_QUEUE);
     if queue.len() < ACCESS_QUEUE_LIMIT {
         queue.extend_from_slice(stamp.as_bytes());
         queue.extend_from_slice(b" ACCESS ");
         queue.extend_from_slice(line.as_bytes());
         queue.push(b'\n');
     }
+    drop(queue);
+    if !ACCESS_WRITER_RUNNING.load(Ordering::Relaxed) {
+        flush();
+    }
 }
 
 pub fn flush() {
-    let queued = std::mem::take(&mut *ACCESS_QUEUE.lock().unwrap());
+    let queued = std::mem::take(&mut *lock(&ACCESS_QUEUE));
     if !queued.is_empty() {
         let _ = std::io::stderr().write_all(&queued);
     }

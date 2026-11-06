@@ -50,9 +50,7 @@ impl<'de> Deserialize<'de> for Policy {
         match Option::<Value>::deserialize(deserializer)? {
             None => Ok(Policy::None),
             Some(Value::String(s)) if s == "*" => Ok(Policy::Any),
-            Some(Value::Array(items)) if items.iter().all(Value::is_string) => {
-                Ok(Policy::Hosts(items.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).collect()))
-            }
+            Some(Value::Array(items)) if items.iter().all(Value::is_string) => Ok(Policy::Hosts(items.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).collect())),
             Some(other) => Err(serde::de::Error::custom(format!("\"network\" must be a list of hosts or \"*\" (got {other})"))),
         }
     }
@@ -112,7 +110,7 @@ fn upstream_timed_out(host: &str, timeout: Duration) -> FetchError {
         code: "upstream_timeout",
         message: "Upstream service timed out".into(),
         hint: Some(UPSTREAM_HINT.into()),
-        details: Some(json!({ "upstream": host, "timeoutMs": timeout.as_millis() as u64 })),
+        details: Some(json!({ "upstream": host, "timeoutMs": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX) })),
     }
 }
 
@@ -154,6 +152,7 @@ impl Egress {
 
     fn new(allow_private: bool, max_bytes: usize, timeout: Duration) -> Self {
         let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        #[expect(clippy::expect_used, reason = "fails only if the crypto provider lacks TLS 1.2 and 1.3, which ring never does; a build that broke that couldn't fetch anything")]
         let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .expect("ring supports the default TLS versions")
@@ -172,9 +171,7 @@ impl Egress {
             let target = Target::of(&uri)?;
             check_allowed(ext, policy, &target.host)?;
             let hop = build_request(&uri, &target, &method, &headers, body.clone(), ext)?;
-            let response = tokio::time::timeout_at(deadline, self.send(&target, hop))
-                .await
-                .map_err(|_| upstream_timed_out(&target.host, self.timeout))??;
+            let response = tokio::time::timeout_at(deadline, self.send(&target, hop)).await.map_err(|_| upstream_timed_out(&target.host, self.timeout))??;
 
             if let Some(next) = redirect_location(&uri, &response)? {
                 redirects += 1;
@@ -195,9 +192,7 @@ impl Egress {
                 uri = next;
                 continue;
             }
-            return tokio::time::timeout_at(deadline, self.read_body(&target.host, response))
-                .await
-                .map_err(|_| upstream_timed_out(&target.host, self.timeout))?;
+            return tokio::time::timeout_at(deadline, self.read_body(&target.host, response)).await.map_err(|_| upstream_timed_out(&target.host, self.timeout))?;
         }
     }
 
@@ -219,16 +214,16 @@ impl Egress {
             Ok(ip) => vec![SocketAddr::new(ip, port)],
             Err(_) => tokio::net::lookup_host((host, port)).await.map_err(|e| upstream_unreachable(host, &e))?.collect(),
         };
-        if !self.allow_private {
-            if let Some(private) = addresses.iter().find(|a| is_private_ip(a.ip())) {
-                return Err(FetchError {
-                    status: 403,
-                    code: "network_private_blocked",
-                    message: format!("Requests to internal addresses are blocked ({host} is {})", private.ip()),
-                    hint: Some("Extensions may only reach public internet hosts. For local development the operator can set \"network\": { \"allowPrivate\": true }.".into()),
-                    details: None,
-                });
-            }
+        if !self.allow_private
+            && let Some(private) = addresses.iter().find(|a| is_private_ip(a.ip()))
+        {
+            return Err(FetchError {
+                status: 403,
+                code: "network_private_blocked",
+                message: format!("Requests to internal addresses are blocked ({host} is {})", private.ip()),
+                hint: Some("Extensions may only reach public internet hosts. For local development the operator can set \"network\": { \"allowPrivate\": true }.".into()),
+                details: None,
+            });
         }
         if addresses.is_empty() {
             return Err(upstream_unreachable(host, &"the host has no addresses"));
@@ -243,9 +238,10 @@ impl Egress {
         }
         let status = response.status().as_u16();
         let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned()))).collect();
-        let body = Limited::new(response.into_body(), self.max_bytes).collect().await.map_err(|e| {
-            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() { upstream_too_large(host, self.max_bytes) } else { upstream_unreachable(host, &*e) }
-        })?;
+        let body = Limited::new(response.into_body(), self.max_bytes)
+            .collect()
+            .await
+            .map_err(|e| if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() { upstream_too_large(host, self.max_bytes) } else { upstream_unreachable(host, &*e) })?;
         Ok(OutResponse { status, headers, body: body.to_bytes().to_vec() })
     }
 }

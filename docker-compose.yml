@@ -1,3 +1,7 @@
+# docker compose up -d                       samishisa on http://localhost:3000 (config in ./config)
+# REDIS_URL=redis://redis:6379 docker compose --profile redis up -d    also starts Redis for shared limits and cache
+#
+# Without ./config/api.config.json it serves the built-in example. `samishisa init config` creates one.
 services:
   samishisa:
     image: ghcr.io/heyngra/samishisa:latest

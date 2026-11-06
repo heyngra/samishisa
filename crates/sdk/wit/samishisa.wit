@@ -1,20 +1,35 @@
+/// Contract between the samishisa server (the host) and an extension (the guest).
+///
+/// An extension is a WebAssembly component built for `wasm32-wasip2`. It exports `extension` and imports only `host`, plus the WASI basics. Extensions have no files, sockets or environment variables: everything goes through `host`.
+///
+/// Extension authors don't touch this file. The `samishisa` crate wraps it.
 package samishisa:extension@0.1.0;
 
 interface types {
+    /// An expected failure, returned to the caller in the standard error envelope.
     record api-error {
         status: u16,
+        /// Machine-readable code, e.g. "city_not_found". Defaults to one per status.
         code: option<string>,
         message: string,
+        /// How the caller can fix the request.
         hint: option<string>,
+        /// Extra JSON shown to the caller.
         details-json: option<string>,
     }
 
+    /// A request routed to one of the extension's routes.
     record request {
+        /// Index of the matched route in the manifest's `routes` list.
         route: u32,
         method: string,
+        /// Full path as the caller sent it, e.g. "/hello/Ada".
         path: string,
+        /// Validated input as one JSON object: `{"params": {...}, "query": {...}, "body": ...}`. Each part was validated and coerced against the route's schemas.
         input-json: string,
+        /// Request headers (lowercase names). Only a safe subset is forwarded.
         headers: list<tuple<string, string>>,
+        /// Id the server assigned to this request (also sent to the caller as `x-request-id`).
         request-id: string,
     }
 
@@ -25,17 +40,23 @@ interface types {
     }
 }
 
+/// Services the server offers. Each one is scoped to the calling extension.
 interface host {
     use types.{api-error};
 
     enum log-level { debug, info, warn, error }
 
+    /// Writes to the server log, tagged with the extension name.
     log: func(level: log-level, message: string);
 
+    /// Persistent key/value store private to this extension. Values are JSON text.
     store-get: func(key: string) -> option<string>;
+    /// `ttl-seconds`: expire the key after that long (none = keep).
     store-set: func(key: string, value-json: string, ttl-seconds: option<u32>);
     store-delete: func(key: string);
+    /// Atomically add `by` to a numeric counter (missing = 0) and return the new value.
     store-incr: func(key: string, by: s64) -> s64;
+    /// Keys starting with `prefix`, sorted.
     store-keys: func(prefix: string) -> list<string>;
 
     record http-request {
@@ -49,20 +70,26 @@ interface host {
         headers: list<tuple<string, string>>,
         body: list<u8>,
     }
+    /// Outbound HTTP, the only network access an extension has. The server applies the extension's `network` allowlist, blocks private and internal addresses, and enforces a timeout and a size cap. Failures come back as 502 or 504 api-errors.
     fetch: func(req: http-request) -> result<http-response, api-error>;
 }
 
+/// What every extension provides.
 interface extension {
     use types.{api-error, request, response};
 
+    /// JSON description of the extension: name, routes and their schemas, config schema, network allowlist, rate limits, cache rules and scheduled jobs. Called once, at load.
     manifest: func() -> string;
 
+    /// Called once per instance, before any other call except `manifest`. Gets the operator's config as JSON, already validated against the config schema.
     init: func(config-json: string) -> result<_, string>;
 
+    /// One-time setup, run once per server start, before serving.
     setup: func() -> result<_, string>;
 
     handle: func(req: request) -> result<response, api-error>;
 
+    /// Runs scheduled job number `job`, an index into the manifest's `jobs`. One instance runs a given job at a time.
     run-job: func(job: u32) -> result<_, string>;
 }
 

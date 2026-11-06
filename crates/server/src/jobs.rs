@@ -15,9 +15,9 @@ impl Jobs {
     pub fn start<'a>(runners: impl Iterator<Item = &'a Arc<Runner>>) -> Jobs {
         let mut timers = Vec::new();
         for runner in runners {
-            for (index, job) in runner.manifest.jobs.iter().enumerate() {
+            for (index, job) in (0..u32::MAX).zip(&runner.manifest.jobs) {
                 let every = Duration::from_millis(job.every_ms).max(SHORTEST_INTERVAL);
-                timers.push(tokio::spawn(run_every(runner.clone(), index as u32, every)));
+                timers.push(tokio::spawn(run_every(runner.clone(), index, every)));
             }
         }
         Jobs(timers)

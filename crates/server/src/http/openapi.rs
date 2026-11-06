@@ -3,13 +3,42 @@ use serde_json::{Map, Value, json};
 use super::Mounted;
 use crate::manifest::RouteManifest;
 
-pub const DOCS_HTML: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>API docs</title>
+const SCALAR_SHA384: &str = "sha384-xgelKlDcc+BYp0O+ZYzFesLnWCgGpEbXVVZWNQT6WyZYygN01tbEMygnjPXb5OPI";
+
+pub fn docs_html(title: &str) -> String {
+    let title: String = title
+        .chars()
+        .map(|c| match c {
+            '<' => "&lt;".to_owned(),
+            '>' => "&gt;".to_owned(),
+            '&' => "&amp;".to_owned(),
+            '"' => "&quot;".to_owned(),
+            c => c.to_string(),
+        })
+        .collect();
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>{title}: API docs</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body><script id="api-reference" data-url="/openapi.json"></script>
-<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.75.0"></script></body></html>"#;
+<body><script id="api-reference" data-url="openapi.json"></script>
+<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.75.0/dist/browser/standalone.js" integrity="{SCALAR_SHA384}" crossorigin="anonymous"></script></body></html>"#
+    )
+}
 
 pub fn build(mounted: &[Mounted], title: &str) -> Value {
+    spec(mounted, json!({ "title": title, "version": env!("CARGO_PKG_VERSION") }))
+}
+
+pub fn build_one(m: &Mounted) -> Value {
+    let manifest = &m.runner.manifest;
+    let mut info = json!({ "title": m.runner.mount, "version": manifest.version.as_deref().unwrap_or("0.0.0") });
+    if let Some(description) = &manifest.description {
+        info["description"] = json!(description);
+    }
+    spec(std::slice::from_ref(m), info)
+}
+
+fn spec(mounted: &[Mounted], info: Value) -> Value {
     let mut components = Map::new();
     components.insert("Error".into(), error_schema());
     let mut paths = Map::new();
@@ -24,7 +53,7 @@ pub fn build(mounted: &[Mounted], title: &str) -> Value {
     }
     json!({
         "openapi": "3.1.0",
-        "info": { "title": title, "version": env!("CARGO_PKG_VERSION") },
+        "info": info,
         "tags": tags,
         "paths": paths,
         "components": { "schemas": components },
@@ -124,10 +153,10 @@ fn hoist(mut schema: Value, prefix: &str, components: &mut Map<String, Value>) -
 fn rewrite_refs(value: &mut Value, prefix: &str) {
     match value {
         Value::Object(o) => {
-            if let Some(Value::String(reference)) = o.get_mut("$ref") {
-                if let Some(name) = reference.strip_prefix("#/$defs/") {
-                    *reference = format!("#/components/schemas/{prefix}.{name}");
-                }
+            if let Some(Value::String(reference)) = o.get_mut("$ref")
+                && let Some(name) = reference.strip_prefix("#/$defs/")
+            {
+                *reference = format!("#/components/schemas/{prefix}.{name}");
             }
             for v in o.values_mut() {
                 rewrite_refs(v, prefix);

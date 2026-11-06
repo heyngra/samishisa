@@ -58,7 +58,7 @@ struct Spin {
 fn spin(Query(q): Query<Spin>) -> &'static str {
     let start = std::time::Instant::now();
     loop {
-        if q.ms > 0 && start.elapsed().as_millis() as u64 >= q.ms {
+        if q.ms > 0 && start.elapsed().as_millis() >= u128::from(q.ms) {
             return "done";
         }
         std::hint::black_box(());
@@ -89,18 +89,18 @@ fn extension() -> Extension<Config> {
         })
         .get("/fetch", fetch)
         .get("/cached", cached)
-            .cache(60)
+        .cache(60)
         .get("/big", big)
         .put("/kv/:key", put)
         .get("/kv/:key", get)
         .get("/spin", spin)
-            .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_millis(500))
         .get("/oom", oom)
         .get("/panic", panics)
         .get("/limited", || "ok")
-            .rate_limit(RateLimit::per_minute(3))
+        .rate_limit(RateLimit::per_minute(3))
         .get("/free", || "ok")
-            .no_rate_limit()
+        .no_rate_limit()
         .get("/ticks", ticks)
 }
 

@@ -5,6 +5,7 @@ mod reply;
 mod router;
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -15,7 +16,12 @@ use std::{
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::{HeaderMap, Method, Request, body::Incoming, http::request::Parts};
+use hyper::{
+    HeaderMap, Method, Request, StatusCode,
+    body::Incoming,
+    header::{ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, CACHE_CONTROL, HeaderName, HeaderValue},
+    http::request::Parts,
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -23,15 +29,15 @@ use crate::{
     clientip, clock, compression,
     config::Config,
     jobs::Jobs,
-    log::{self, log_error},
+    log::{self, log_error, log_warn},
     ratelimit::{Decision, Limiter, RateSetting, RateSettings},
-    runtime::{CallError, Runner, WitError, WitRequest},
+    runtime::{CallError, Runner, WitError, WitRequest, WitResponse},
 };
 use input::Input;
 use reply::{ErrorReply, Res};
 use router::{Match, Route};
 
-const RESERVED_NAMES: &[&str] = &["docs", "openapi.json", "health", "favicon.ico", "robots.txt"];
+const RESERVED_NAMES: &[&str] = &["docs", "openapi", "openapi.json", "health", "favicon.ico", "robots.txt"];
 const EXPOSED_HEADERS: &str = "x-request-id, x-cache, ratelimit-limit, ratelimit-remaining, ratelimit-reset, retry-after, etag";
 const HEADERS_EXTENSIONS_CANT_SET: &[&str] = &["content-length", "transfer-encoding", "connection", "x-request-id", "content-encoding"];
 
@@ -97,6 +103,8 @@ pub struct App {
     limiter: Arc<Limiter>,
     cache: Arc<ResponseCache>,
     openapi: Bytes,
+    extension_specs: HashMap<String, Bytes>,
+    docs: Option<Bytes>,
     request_ids: RequestIds,
     _jobs: Jobs,
 }
@@ -112,9 +120,11 @@ impl App {
             }
         }
         let openapi = Bytes::from(serde_json::to_vec_pretty(&openapi::build(&mounted, &config.title)).unwrap_or_default());
+        let extension_specs = mounted.iter().map(|m| (m.runner.mount.clone(), Bytes::from(serde_json::to_vec_pretty(&openapi::build_one(m)).unwrap_or_default()))).collect();
+        let docs = (config.docs_page() && config.describe_routes).then(|| Bytes::from(openapi::docs_html(&config.title)));
         let jobs = Jobs::start(mounted.iter().map(|m| &m.runner));
         let request_ids = RequestIds { next: AtomicU64::new(1), salt: clock::now_ms().wrapping_mul(1_000_003) };
-        App { mounted, failed, config, limiter, cache, openapi, request_ids, _jobs: jobs }
+        App { mounted, failed, config, limiter, cache, openapi, extension_specs, docs, request_ids, _jobs: jobs }
     }
 
     pub fn mounted(&self) -> &[Mounted] {
@@ -138,10 +148,12 @@ impl App {
             response = compression::compress(response).await;
         }
         let headers = response.headers_mut();
-        headers.insert("x-request-id", id.parse().expect("hex is a valid header"));
+        if let Ok(id) = HeaderValue::from_str(&id) {
+            headers.insert("x-request-id", id);
+        }
         if from_browser && self.config.cors {
-            headers.insert("access-control-allow-origin", "*".parse().expect("static"));
-            headers.insert("access-control-expose-headers", EXPOSED_HEADERS.parse().expect("static"));
+            headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static(EXPOSED_HEADERS));
         }
         if self.config.access_log {
             let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -157,13 +169,29 @@ impl App {
         }
         let path = request.uri().path().to_owned();
         let parts = router::split_path(&path);
+        let reading = matches!(*request.method(), Method::GET | Method::HEAD);
         let Some((name, rest)) = parts.split_first() else {
-            return reply::json(200, &describe::index(&self.config.title, &self.mounted, &self.failed));
-        };
-        if rest.is_empty() {
-            if let Some(page) = self.server_page(name) {
-                return page;
+            if !reading {
+                return read_only(request.method(), id);
             }
+            if !self.config.describe_routes {
+                return reply::json(200, &json!({ "name": self.config.title }));
+            }
+            return reply::json(200, &describe::index(&self.config.title, self.docs.is_some(), &self.mounted, &self.failed));
+        };
+        if *name == "openapi" {
+            if !reading {
+                return read_only(request.method(), id);
+            }
+            if !self.config.describe_routes {
+                return nothing_at(&path, id);
+            }
+            return self.extension_spec(rest, id);
+        }
+        if rest.is_empty()
+            && let Some(page) = self.server_page(name)
+        {
+            return if reading { page } else { read_only(request.method(), id) };
         }
         let Some(extension) = self.mounted.iter().find(|m| m.runner.mount == *name) else {
             return self.unknown_extension(name, id);
@@ -171,17 +199,17 @@ impl App {
 
         let is_head = request.method() == Method::HEAD;
         let method = if is_head { "GET".to_owned() } else { request.method().to_string() };
-        if rest.is_empty() && method == "GET" {
+        if rest.is_empty() && method == "GET" && self.config.describe_routes {
             return reply::json(200, &describe::extension(extension));
         }
         let (route, params) = match router::find(&extension.routes, &method, rest) {
             Match::Found { route, params } => (route, params),
-            unmatched => return no_matching_route(unmatched, extension, request.method(), &path, id),
+            unmatched => return no_matching_route(unmatched, extension, request.method(), &path, self.config.describe_routes, id),
         };
 
         let rate = match self.check_rate_limit(route, client, id).await {
             Ok(decision) => decision,
-            Err(too_many) => return too_many,
+            Err(too_many) => return *too_many,
         };
         let (head, body) = request.into_parts();
         let input = match self.read_input(&head, body, route, &params, &method).await {
@@ -208,23 +236,49 @@ impl App {
     }
 
     fn unknown_extension(&self, name: &str, id: &str) -> Res {
-        let hint = match router::closest(name, self.mounted.iter().map(|m| m.runner.mount.as_str())) {
-            Some(close) => format!("Did you mean /{close}?"),
-            None => "GET / lists the available extensions.".into(),
+        if name == "docs" {
+            return ErrorReply::new(404, "not_found", "The docs page is switched off")
+                .hint("Serving it needs builtin:docs in the config (`samishisa add builtin:docs`) and \"describeRoutes\": true")
+                .into_response(id);
+        }
+        let mut reply = ErrorReply::new(404, "not_found", format!("No extension named \"{name}\""));
+        if self.config.describe_routes {
+            let hint = match router::closest(name, self.mounted.iter().map(|m| m.runner.mount.as_str())) {
+                Some(close) => format!("Did you mean /{close}?"),
+                None => "GET / lists the available extensions.".into(),
+            };
+            reply = reply.hint(hint);
+        }
+        reply.into_response(id)
+    }
+
+    fn extension_spec(&self, rest: &[&str], id: &str) -> Res {
+        let name = match rest {
+            [file] => file.strip_suffix(".json").unwrap_or(file),
+            _ => "",
         };
-        ErrorReply::new(404, "not_found", format!("No extension named \"{name}\"")).hint(hint).into_response(id)
+        match self.extension_specs.get(name) {
+            Some(spec) => reply::bytes(200, "application/json", spec.clone()),
+            None => {
+                let available: Vec<String> = self.mounted.iter().map(|m| format!("/openapi/{}.json", m.runner.mount)).collect();
+                ErrorReply::new(404, "not_found", format!("No extension named \"{name}\""))
+                    .hint("/openapi.json has every extension; /openapi/<name>.json has one")
+                    .details(json!({ "available": available }))
+                    .into_response(id)
+            }
+        }
     }
 
     fn server_page(&self, name: &str) -> Option<Res> {
         Some(match name {
             "health" => reply::json(200, &json!({ "ok": true })),
-            "openapi.json" => reply::bytes(200, "application/json", self.openapi.clone()),
-            "docs" => reply::bytes(200, "text/html; charset=utf-8", Bytes::from_static(openapi::DOCS_HTML.as_bytes())),
+            "openapi.json" if self.config.describe_routes => reply::bytes(200, "application/json", self.openapi.clone()),
+            "docs" => reply::bytes(200, "text/html; charset=utf-8", self.docs.clone()?),
             _ => return None,
         })
     }
 
-    async fn check_rate_limit(&self, route: &Route, client: IpAddr, id: &str) -> Result<Option<Decision>, Res> {
+    async fn check_rate_limit(&self, route: &Route, client: IpAddr, id: &str) -> Result<Option<Decision>, Box<Res>> {
         let Some(route_limit) = &route.rate_limit else { return Ok(None) };
         let decision = self.limiter.check(&route_limit.key_for(client), route_limit.limit).await;
         if decision.allowed {
@@ -237,7 +291,7 @@ impl App {
             .into_response(id);
         set_rate_headers(response.headers_mut(), &decision);
         response.headers_mut().insert("retry-after", decision.reset_sec.into());
-        Err(response)
+        Err(Box::new(response))
     }
 
     async fn read_input(&self, head: &Parts, body: Incoming, route: &Route, params: &[(&str, &str)], method: &str) -> Result<Input, ErrorReply> {
@@ -259,6 +313,11 @@ impl App {
         let Some(rule) = route.cache else {
             return reply::from_produced(call_runner(&extension.runner, call, route.timeout).await, &id);
         };
+        if call.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization")) {
+            let mut response = reply::from_produced(call_runner(&extension.runner, call, route.timeout).await, &id);
+            response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+            return response;
+        }
         let key = format!("{}\u{0}{}\u{0}{}\u{0}{}", extension.runner.mount, route.index, input.params, input.query);
         let (runner, timeout) = (extension.runner.clone(), route.timeout);
         let producer: Producer = Arc::new(move || {
@@ -279,11 +338,7 @@ async fn call_runner(runner: &Runner, call: WitRequest, timeout: Duration) -> Pr
         Err(_) => Err(CallError::Timeout),
     };
     match outcome {
-        Ok(Ok(response)) => Produced {
-            status: response.status,
-            headers: response.headers.into_iter().filter(|(name, _)| !HEADERS_EXTENSIONS_CANT_SET.contains(&name.as_str())).collect(),
-            body: Bytes::from(response.body),
-        },
+        Ok(Ok(response)) => checked_response(runner, id, response),
         Ok(Err(error)) => extension_error(error).into_produced(id),
         Err(CallError::Timeout) => ErrorReply::new(504, "timeout", format!("The request took longer than {} ms", timeout.as_millis())).into_produced(id),
         Err(CallError::Busy) => {
@@ -300,23 +355,59 @@ async fn call_runner(runner: &Runner, call: WitRequest, timeout: Duration) -> Pr
     }
 }
 
-fn no_matching_route(unmatched: Match<'_, '_>, extension: &Mounted, method: &Method, path: &str, id: &str) -> Res {
+fn checked_response(runner: &Runner, id: &str, response: WitResponse) -> Produced {
+    if StatusCode::from_u16(response.status).is_err() {
+        log_error!(&runner.mount, "[{id}] answered with the invalid HTTP status {}", response.status);
+        return ErrorReply::new(500, "internal_error", "The extension returned an invalid response")
+            .hint("The details are in the server log under this request id")
+            .into_produced(id);
+    }
+    let headers = response
+        .headers
+        .into_iter()
+        .filter(|(name, value)| {
+            if HEADERS_EXTENSIONS_CANT_SET.iter().any(|reserved| name.eq_ignore_ascii_case(reserved)) {
+                return false;
+            }
+            let valid = HeaderName::from_bytes(name.as_bytes()).is_ok() && HeaderValue::from_str(value).is_ok();
+            if !valid {
+                log_warn!(&runner.mount, "[{id}] dropped the invalid response header {name:?}");
+            }
+            valid
+        })
+        .collect();
+    Produced { status: response.status, headers, body: Bytes::from(response.body) }
+}
+
+fn read_only(method: &Method, id: &str) -> Res {
+    let mut response = ErrorReply::new(405, "method_not_allowed", format!("{method} is not allowed here")).hint("Use GET").into_response(id);
+    response.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+    response
+}
+
+fn no_matching_route(unmatched: Match<'_, '_>, extension: &Mounted, method: &Method, path: &str, describe: bool, id: &str) -> Res {
     match unmatched {
         Match::WrongMethod { allowed } => {
-            let mut response = ErrorReply::new(405, "method_not_allowed", format!("{method} is not allowed here"))
-                .hint(format!("Use {}", allowed.join(" or ")))
-                .into_response(id);
-            response.headers_mut().insert("allow", allowed.join(", ").parse().expect("method names"));
+            let mut response = ErrorReply::new(405, "method_not_allowed", format!("{method} is not allowed here")).hint(format!("Use {}", allowed.join(" or "))).into_response(id);
+            if let Ok(allow) = HeaderValue::from_str(&allowed.join(", ")) {
+                response.headers_mut().insert(ALLOW, allow);
+            }
             response
         }
         _ => {
-            let routes: Vec<&str> = extension.routes.iter().map(|r| r.usage.as_str()).collect();
-            ErrorReply::new(404, "not_found", format!("No route matches {method} {path}"))
-                .hint(format!("GET /{} describes every route", extension.runner.mount))
-                .details(json!({ "routes": routes }))
-                .into_response(id)
+            let mut reply = ErrorReply::new(404, "not_found", format!("No route matches {method} {path}"));
+            if describe {
+                let routes: Vec<&str> = extension.routes.iter().map(|r| r.usage.as_str()).collect();
+                reply = reply.hint(format!("GET /{} describes every route", extension.runner.mount)).details(json!({ "routes": routes }));
+            }
+            reply.into_response(id)
         }
     }
+}
+
+/// Reply for a route listing that is switched off. It looks like any other unknown path.
+fn nothing_at(path: &str, id: &str) -> Res {
+    ErrorReply::new(404, "not_found", format!("Nothing at {path}")).into_response(id)
 }
 
 fn extension_error(error: WitError) -> ErrorReply {
@@ -335,9 +426,9 @@ fn preflight(request_headers: &HeaderMap) -> Res {
     let allow_headers = request_headers.get("access-control-request-headers").and_then(|v| v.to_str().ok()).unwrap_or("content-type, authorization");
     let mut response = reply::empty(204);
     let headers = response.headers_mut();
-    headers.insert("access-control-allow-origin", "*".parse().expect("static"));
-    headers.insert("access-control-allow-methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".parse().expect("static"));
-    headers.insert("access-control-max-age", "86400".parse().expect("static"));
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"));
+    headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
     if let Ok(value) = allow_headers.parse() {
         headers.insert("access-control-allow-headers", value);
     }
@@ -345,11 +436,7 @@ fn preflight(request_headers: &HeaderMap) -> Res {
 }
 
 fn forwarded_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(name, _)| is_forwarded_header(name.as_str()))
-        .filter_map(|(name, value)| Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned())))
-        .collect()
+    headers.iter().filter(|(name, _)| is_forwarded_header(name.as_str())).filter_map(|(name, value)| Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))).collect()
 }
 
 fn set_rate_headers(headers: &mut HeaderMap, decision: &Decision) {

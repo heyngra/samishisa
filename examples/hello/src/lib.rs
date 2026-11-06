@@ -1,7 +1,12 @@
+//! A small extension that shows every SDK feature. Copy the folder to start your own, or run `samishisa new <name>`.
+
 use samishisa::prelude::*;
 
+/// Settings the operator can set in `api.config.json`:
+/// `{ "source": "./hello.wasm", "config": { "greeting": "Hey" } }`
 #[schema]
 struct Config {
+    /// The word used to greet people.
     #[serde(default = "default_greeting")]
     greeting: String,
 }
@@ -10,8 +15,10 @@ fn default_greeting() -> String {
     "Hello".into()
 }
 
+/// Query string of `GET /hello/:name`.
 #[schema]
 struct GreetQuery {
+    /// Uppercase the greeting.
     #[serde(default)]
     shout: bool,
 }
@@ -26,9 +33,11 @@ fn greet(Path(name): Path<String>, Query(q): Query<GreetQuery>, ctx: Ctx<Config>
     Json(Greeting { message: if q.shout { message.to_uppercase() } else { message } })
 }
 
+/// Body of `POST /hello/echo`.
 #[schema]
 struct Echo {
     text: String,
+    /// How many times to repeat it (1 to 10).
     #[serde(default = "one")]
     #[schemars(range(min = 1, max = 10))]
     repeat: u8,
@@ -53,6 +62,7 @@ fn visits(ctx: Ctx<Config>) -> Json<Visits> {
 
 #[schema]
 struct Time {
+    /// Milliseconds since the Unix epoch, when this response was generated.
     now_ms: u128,
 }
 
@@ -67,7 +77,8 @@ fn teapot() -> Result<()> {
 
 fn boom() -> Result<()> {
     let n: u32 = "secret internal detail that must not leak".parse()?;
-    Ok(println!("{n}"))
+    println!("{n}");
+    Ok(())
 }
 
 fn extension() -> Extension<Config> {
@@ -77,19 +88,19 @@ fn extension() -> Extension<Config> {
             Ok(())
         })
         .get("/:name", greet)
-            .summary("Greet someone")
+        .summary("Greet someone")
         .post("/echo", echo)
-            .summary("Echo a JSON body back")
+        .summary("Echo a JSON body back")
         .get("/visits", visits)
-            .summary("Persistent counter (uses ctx.store)")
-            .no_rate_limit()
+        .summary("Persistent counter (uses ctx.store)")
+        .no_rate_limit()
         .get("/time", time)
-            .summary("Server time, cached for 5 seconds for all callers")
-            .cache(5)
+        .summary("Server time, cached for 5 seconds for all callers")
+        .cache(5)
         .get("/teapot", teapot)
-            .summary("Shows how to return an expected error")
+        .summary("Shows how to return an expected error")
         .get("/boom", boom)
-            .summary("Fails unexpectedly (the server turns it into a clean 500)")
+        .summary("Fails unexpectedly (the server turns it into a clean 500)")
 }
 
 samishisa::export!(extension);

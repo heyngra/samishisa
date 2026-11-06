@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{cache::CacheRule, netguard::Policy, ratelimit::RateSetting};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
     pub sdk: Option<String>,

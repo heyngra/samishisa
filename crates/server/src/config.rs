@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Deserializer};
@@ -30,7 +33,10 @@ pub struct Config {
     pub cors: bool,
     pub max_instances: u32,
     pub title: String,
+    /// Serves route listings (`GET /`, `GET /<name>`, `/openapi.json`, `/openapi/<name>.json`, `/docs`) and lists routes in 404 replies. Off by default, so callers can't see routes they don't already know.
+    pub describe_routes: bool,
     pub extensions: Vec<ExtensionEntry>,
+    pub tunnel: TunnelConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
     #[serde(skip)]
@@ -55,21 +61,33 @@ impl Default for Config {
             cors: true,
             max_instances: 256,
             title: "samishisa".into(),
+            describe_routes: false,
             extensions: Vec::new(),
+            tunnel: TunnelConfig::default(),
             base_dir: PathBuf::from("."),
             path: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct NetworkConfig {
     pub allow_private: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct TunnelConfig {
+    pub enabled: bool,
+    pub token: Option<String>,
+    pub url: Option<String>,
+    pub binary: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtensionEntry {
+    pub enabled: bool,
     pub source: String,
     pub name: Option<String>,
     pub config: Value,
@@ -83,6 +101,7 @@ pub struct ExtensionEntry {
 impl ExtensionEntry {
     pub fn from_source(source: impl Into<String>) -> Self {
         ExtensionEntry {
+            enabled: true,
             source: source.into(),
             name: None,
             config: Value::Object(Default::default()),
@@ -99,6 +118,7 @@ impl ExtensionEntry {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct EntryObject {
     source: String,
+    enabled: Option<bool>,
     name: Option<String>,
     config: Option<Value>,
     network: Option<Policy>,
@@ -116,6 +136,7 @@ impl<'de> Deserialize<'de> for ExtensionEntry {
             other => EntryObject::deserialize(other).map_err(|e| serde::de::Error::custom(format!("in an extension entry: {e}")))?,
         };
         Ok(ExtensionEntry {
+            enabled: object.enabled.unwrap_or(true),
             source: object.source,
             name: object.name,
             config: object.config.unwrap_or_else(|| Value::Object(Default::default())),
@@ -126,6 +147,23 @@ impl<'de> Deserialize<'de> for ExtensionEntry {
             sha256: object.sha256,
         })
     }
+}
+
+pub fn user_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("samishisa"))
+}
+
+pub fn default_path() -> PathBuf {
+    let local = PathBuf::from("api.config.json");
+    if local.exists() {
+        return local;
+    }
+    user_dir().map(|d| d.join("config.json")).unwrap_or(local)
 }
 
 impl Config {
@@ -140,14 +178,27 @@ impl Config {
         } else {
             Config::default()
         };
+        cfg.finish(path)?;
+        Ok(cfg)
+    }
+
+    pub fn from_value(value: Value, path: &Path) -> anyhow::Result<Self> {
+        let mut cfg: Config = serde_json::from_value(value).context("not a valid samishisa config")?;
+        cfg.path = Some(path.to_path_buf());
+        cfg.finish(path)?;
+        Ok(cfg)
+    }
+
+    fn finish(&mut self, path: &Path) -> anyhow::Result<()> {
+        let cfg = self;
         cfg.base_dir = path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
         if let Ok(port) = std::env::var("PORT") {
             cfg.port = port.parse().context("PORT must be a number")?;
         }
-        if let Ok(url) = std::env::var("REDIS_URL").map(|u| u.trim().to_owned()) {
-            if !url.is_empty() {
-                cfg.redis = Some(url);
-            }
+        if let Ok(url) = std::env::var("REDIS_URL").map(|u| u.trim().to_owned())
+            && !url.is_empty()
+        {
+            cfg.redis = Some(url);
         }
         if let Ok(dir) = std::env::var("SAMISHISA_DATA") {
             cfg.data_dir = PathBuf::from(dir);
@@ -155,10 +206,42 @@ impl Config {
         if cfg.data_dir.is_relative() {
             cfg.data_dir = cfg.base_dir.join(&cfg.data_dir);
         }
-        if cfg.max_instances == 0 {
+        cfg.check()
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        if self.max_instances == 0 {
             bail!("maxInstances must be at least 1");
         }
-        Ok(cfg)
+        listen_ip(&self.host)?;
+        Ok(())
+    }
+
+    pub fn validate(value: &Value) -> anyhow::Result<()> {
+        let cfg: Config = serde_json::from_value(value.clone())?;
+        cfg.check()
+    }
+
+    pub fn restart_only_changes(&self, newer: &Config) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let mut differs = |name, d: bool| {
+            if d {
+                changed.push(name);
+            }
+        };
+        differs("port", self.port != newer.port);
+        differs("host", self.host != newer.host);
+        differs("threads", self.threads != newer.threads);
+        differs("redis", self.redis != newer.redis);
+        differs("maxInstances", self.max_instances != newer.max_instances);
+        differs("network", self.network != newer.network);
+        differs("dataDir", self.data_dir != newer.data_dir);
+        differs("tunnel", self.tunnel != newer.tunnel);
+        changed
+    }
+
+    pub fn docs_page(&self) -> bool {
+        self.extensions.iter().any(|e| e.enabled && e.source.trim() == "builtin:docs")
     }
 
     pub fn serving_threads(&self) -> usize {
@@ -171,6 +254,30 @@ impl Config {
     pub fn max_memory_mb(&self) -> u32 {
         self.extensions.iter().map(|e| e.memory_mb).max().unwrap_or(DEFAULT_MEMORY_MB).max(DEFAULT_MEMORY_MB)
     }
+}
+
+pub fn listen_ip(host: &str) -> anyhow::Result<IpAddr> {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| anyhow::anyhow!("host {host:?} is not an IP address: use 0.0.0.0 (every interface), 127.0.0.1 (this machine only), :: or ::1"))
+}
+
+pub fn listen_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    Ok(SocketAddr::new(listen_ip(host)?, port))
+}
+
+pub fn local_address(host: &str, port: u16) -> SocketAddr {
+    let ip = match listen_ip(host) {
+        Ok(ip) if ip.is_unspecified() && ip.is_ipv6() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        Ok(ip) if !ip.is_unspecified() => ip,
+        _ => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    SocketAddr::new(ip, port)
 }
 
 pub fn interpolate_env(value: &Value, at: &str) -> anyhow::Result<Value> {
@@ -200,6 +307,7 @@ mod tests {
 
     #[test]
     fn env_interpolation() {
+        // SAFETY: no other test in this binary reads these variables.
         unsafe { std::env::set_var("SAMISHISA_TEST_KEY", "k123") };
         let v = serde_json::json!({ "a": "${SAMISHISA_TEST_KEY}", "b": ["x-${SAMISHISA_TEST_KEY}-y"], "c": 1 });
         assert_eq!(interpolate_env(&v, "config").unwrap(), serde_json::json!({ "a": "k123", "b": ["x-k123-y"], "c": 1 }));
@@ -216,6 +324,9 @@ mod tests {
         assert_eq!(c.extensions[1].rate_limit, RateSetting::Off);
         assert_eq!(c.max_memory_mb(), 128);
         assert_eq!(c.port, 3000, "missing fields take their defaults");
+        assert!(!c.describe_routes, "route listings are opt-in");
+        let on: Config = serde_json::from_str(r#"{ "describeRoutes": true }"#).unwrap();
+        assert!(on.describe_routes);
     }
 
     #[test]
@@ -226,5 +337,19 @@ mod tests {
         assert!(error(r#"{ "extensions": [{ "source": "x", "network": "example.com" }] }"#).contains("network"));
         assert!(error(r#"{ "rateLimit": { "limit": -1 } }"#).contains("limit"));
         assert!(error(r#"{ "trustProxy": "sometimes" }"#).contains("trustProxy"));
+        assert!(Config::validate(&serde_json::json!({ "port": 99999 })).is_err());
+        assert!(Config::validate(&serde_json::json!({ "port": "abc" })).is_err());
+        assert!(Config::validate(&serde_json::json!({ "host": "my-laptop" })).is_err());
+        assert!(Config::validate(&serde_json::json!({ "port": 8080, "host": "::" })).is_ok());
+    }
+
+    #[test]
+    fn listen_addresses() {
+        assert_eq!(listen_address("::", 3000).unwrap().to_string(), "[::]:3000");
+        assert_eq!(listen_address("0.0.0.0", 80).unwrap().to_string(), "0.0.0.0:80");
+        assert_eq!(listen_address("localhost", 80).unwrap().to_string(), "127.0.0.1:80");
+        assert_eq!(local_address("0.0.0.0", 3000).to_string(), "127.0.0.1:3000");
+        assert_eq!(local_address("::", 3000).to_string(), "[::1]:3000");
+        assert_eq!(local_address("192.168.1.5", 3000).to_string(), "192.168.1.5:3000");
     }
 }

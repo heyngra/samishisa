@@ -1,6 +1,9 @@
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::Response;
+use hyper::{
+    Response, StatusCode,
+    header::{CONTENT_TYPE, HeaderValue},
+};
 use serde_json::{Value, json};
 
 use crate::cache::Produced;
@@ -11,12 +14,20 @@ pub fn json(status: u16, value: &Value) -> Res {
     bytes(status, "application/json", Bytes::from(serde_json::to_vec(value).unwrap_or_default()))
 }
 
-pub fn bytes(status: u16, content_type: &str, body: Bytes) -> Res {
-    Response::builder().status(status).header("content-type", content_type).body(Full::new(body)).expect("valid response")
+pub fn bytes(status: u16, content_type: &'static str, body: Bytes) -> Res {
+    let mut response = with_status(status, body);
+    response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 pub fn empty(status: u16) -> Res {
-    Response::builder().status(status).body(Full::new(Bytes::new())).expect("valid response")
+    with_status(status, Bytes::new())
+}
+
+fn with_status(status: u16, body: Bytes) -> Res {
+    let mut response = Response::new(Full::new(body));
+    *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    response
 }
 
 pub fn from_produced(produced: Produced, request_id: &str) -> Res {
@@ -24,9 +35,7 @@ pub fn from_produced(produced: Produced, request_id: &str) -> Res {
     for (name, value) in &produced.headers {
         builder = builder.header(name, value);
     }
-    builder
-        .body(Full::new(produced.body))
-        .unwrap_or_else(|_| ErrorReply::new(500, "internal_error", "The extension returned an invalid response").into_response(request_id))
+    builder.body(Full::new(produced.body)).unwrap_or_else(|_| ErrorReply::new(500, "internal_error", "The extension returned an invalid response").into_response(request_id))
 }
 
 pub struct ErrorReply {

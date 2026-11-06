@@ -8,14 +8,14 @@ use std::{
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{clock, log::log_error};
+use crate::{clock, log::log_error, sync::lock};
 
 pub struct Store {
     conn: Mutex<Connection>,
 }
 
 fn now_ms() -> i64 {
-    clock::now_ms() as i64
+    i64::try_from(clock::now_ms()).unwrap_or(i64::MAX)
 }
 
 fn or_log<T>(operation: &str, key: &str, result: rusqlite::Result<T>, fallback: T) -> T {
@@ -46,7 +46,7 @@ impl Store {
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        let c = self.conn.lock().unwrap();
+        let c = lock(&self.conn);
         let result = c
             .prepare_cached("SELECT value FROM kv WHERE key = ?1 AND (expires IS NULL OR expires >= ?2)")
             .and_then(|mut s| s.query_row(params![key, now_ms()], |r| r.get(0)).optional());
@@ -54,35 +54,30 @@ impl Store {
     }
 
     pub fn set(&self, key: &str, value: &str, ttl: Option<Duration>) {
-        let expires = ttl.map(|t| now_ms() + t.as_millis() as i64);
-        let c = self.conn.lock().unwrap();
-        let result = c
-            .prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)")
-            .and_then(|mut s| s.execute(params![key, value, expires]));
+        let expires = ttl.map(|t| now_ms().saturating_add(i64::try_from(t.as_millis()).unwrap_or(i64::MAX)));
+        let c = lock(&self.conn);
+        let result = c.prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)").and_then(|mut s| s.execute(params![key, value, expires]));
         or_log("set", key, result.map(drop), ());
     }
 
     pub fn delete(&self, key: &str) {
-        let c = self.conn.lock().unwrap();
+        let c = lock(&self.conn);
         let result = c.prepare_cached("DELETE FROM kv WHERE key = ?1").and_then(|mut s| s.execute(params![key]));
         or_log("delete", key, result.map(drop), ());
     }
 
     pub fn incr(&self, key: &str, by: i64) -> i64 {
-        let mut c = self.conn.lock().unwrap();
+        let mut c = lock(&self.conn);
         let result = (|| -> rusqlite::Result<i64> {
             let tx = c.transaction()?;
-            let row: Option<(String, Option<i64>)> = tx
-                .prepare_cached("SELECT value, expires FROM kv WHERE key = ?1")?
-                .query_row(params![key], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
+            let row: Option<(String, Option<i64>)> =
+                tx.prepare_cached("SELECT value, expires FROM kv WHERE key = ?1")?.query_row(params![key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             let (current, expires) = match row {
                 Some((value, expires)) if expires.is_none_or(|e| e >= now_ms()) => (value.trim().parse::<i64>().unwrap_or(0), expires),
                 _ => (0, None),
             };
             let next = current.saturating_add(by);
-            tx.prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)")?
-                .execute(params![key, next.to_string(), expires])?;
+            tx.prepare_cached("INSERT OR REPLACE INTO kv (key, value, expires) VALUES (?1, ?2, ?3)")?.execute(params![key, next.to_string(), expires])?;
             tx.commit()?;
             Ok(next)
         })();
@@ -90,18 +85,15 @@ impl Store {
     }
 
     pub fn keys(&self, prefix: &str) -> Vec<String> {
-        let c = self.conn.lock().unwrap();
-        let result = c
-            .prepare_cached("SELECT key FROM kv WHERE substr(key, 1, ?1) = ?2 AND (expires IS NULL OR expires >= ?3) ORDER BY key")
-            .and_then(|mut s| {
-                s.query_map(params![prefix.chars().count() as i64, prefix, now_ms()], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            });
+        let c = lock(&self.conn);
+        let result = c.prepare_cached("SELECT key FROM kv WHERE substr(key, 1, ?1) = ?2 AND (expires IS NULL OR expires >= ?3) ORDER BY key").and_then(|mut s| {
+            s.query_map(params![i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX), prefix, now_ms()], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()
+        });
         or_log("keys", prefix, result, Vec::new())
     }
 
     pub fn delete_expired(&self) {
-        let c = self.conn.lock().unwrap();
+        let c = lock(&self.conn);
         let result = c.execute("DELETE FROM kv WHERE expires IS NOT NULL AND expires < ?1", params![now_ms()]);
         or_log("delete expired", "", result.map(drop), ());
     }
@@ -115,7 +107,7 @@ pub struct Stores {
 impl Stores {
     pub fn open(&self, data_dir: &Path, extension: &str) -> anyhow::Result<Arc<Store>> {
         let path = data_dir.join("ext").join(extension).join("store.db");
-        let mut open = self.open.lock().unwrap();
+        let mut open = lock(&self.open);
         if let Some(store) = open.get(&path) {
             return Ok(store.clone());
         }
@@ -130,9 +122,14 @@ impl Stores {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                let all: Vec<Arc<Store>> = stores.open.lock().unwrap().values().cloned().collect();
-                for store in all {
-                    store.delete_expired();
+                let all: Vec<Arc<Store>> = lock(&stores.open).values().cloned().collect();
+                let swept = tokio::task::spawn_blocking(move || {
+                    for store in all {
+                        store.delete_expired();
+                    }
+                });
+                if let Err(e) = swept.await {
+                    log_error!("store", "deleting expired keys failed: {e}");
                 }
             }
         });

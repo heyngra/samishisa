@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    hash::{BuildHasher, Hash, Hasher},
+    hash::BuildHasher,
     net::IpAddr,
     sync::{Arc, Mutex},
 };
@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-use crate::{clock::now_ms, ipnet::unmap, redis::RedisGuard};
+use crate::{clock::now_ms, ipnet::unmap, redis::RedisGuard, sync::lock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limit {
@@ -43,7 +43,7 @@ impl RateSetting {
             match object.get(key) {
                 None => Ok(None),
                 Some(v) => match v.as_u64().filter(|n| *n > 0) {
-                    Some(n) => Ok(Some(n.min(u32::MAX as u64) as u32)),
+                    Some(n) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
                     None => Err(format!("a rate limit's \"{key}\" must be a positive integer (got {v})")),
                 },
             }
@@ -126,13 +126,15 @@ pub struct Decision {
     pub reset_sec: u64,
 }
 
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "the floats are non-negative and floored/ceiled; `as` saturates at the integer's range")]
+#[expect(clippy::cast_precision_loss, reason = "request counts are far below 2^52")]
 fn decide(previous: u64, current: u64, limit: Limit, now: u64) -> Decision {
-    let window_ms = limit.window_sec as u64 * 1000;
+    let window_ms = u64::from(limit.window_sec) * 1000;
     let elapsed_fraction = (now % window_ms) as f64 / window_ms as f64;
     let used = previous as f64 * (1.0 - elapsed_fraction) + current as f64;
     let reset_sec = ((window_ms - now % window_ms) as f64 / 1000.0).ceil().max(1.0) as u64;
-    let remaining = (limit.limit as f64 - used - 1.0).max(0.0).floor() as u32;
-    let allowed = used < limit.limit as f64;
+    let remaining = (f64::from(limit.limit) - used - 1.0).max(0.0).floor() as u32;
+    let allowed = used < f64::from(limit.limit);
     Decision { allowed, limit: limit.limit, remaining: if allowed { remaining } else { 0 }, reset_sec }
 }
 
@@ -157,10 +159,9 @@ impl MemoryLimiter {
     }
 
     fn check_at(&self, key: &str, limit: Limit, now: u64) -> Decision {
-        let window = now / (limit.window_sec as u64 * 1000);
-        let mut h = self.hasher.build_hasher();
-        key.hash(&mut h);
-        let mut shard = self.shards[(h.finish() as usize) % SHARDS].lock().unwrap();
+        let window = now / (u64::from(limit.window_sec) * 1000);
+        let shard_index = usize::try_from(self.hasher.hash_one(key) % SHARDS as u64).unwrap_or(0);
+        let mut shard = lock(&self.shards[shard_index]);
         if shard.len() >= MAX_KEYS_PER_SHARD && !shard.contains_key(key) {
             shard.retain(|_, c| c.window + 1 >= window);
             if shard.len() >= MAX_KEYS_PER_SHARD {
@@ -207,7 +208,7 @@ impl Limiter {
 }
 
 async fn check_redis(redis: &RedisGuard, key: &str, limit: Limit) -> Option<Decision> {
-    let window_ms = limit.window_sec as u64 * 1000;
+    let window_ms = u64::from(limit.window_sec) * 1000;
     let now = now_ms();
     let window = now / window_ms;
     let current_key = format!("samishisa:rl:{key}:{window}");

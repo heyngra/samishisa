@@ -2,6 +2,8 @@ mod host;
 mod runner;
 
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{BuildHasher, BuildHasherDefault},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -39,11 +41,11 @@ const TICK: Duration = Duration::from_millis(10);
 const MANIFEST_DEADLINE: Duration = Duration::from_secs(5);
 
 fn ticks(deadline: Duration) -> u64 {
-    (deadline.as_millis() / TICK.as_millis()).max(1) as u64
+    u64::try_from(deadline.as_millis() / TICK.as_millis()).unwrap_or(u64::MAX).max(1)
 }
 
 fn megabytes(mb: u32) -> usize {
-    (mb as usize) << 20
+    usize::try_from(mb).unwrap_or(usize::MAX).saturating_mul(1 << 20)
 }
 
 pub struct Sandbox {
@@ -86,16 +88,19 @@ impl Sandbox {
             None => new_engine(None, max_memory_mb)?,
         };
         let ticking = engine.clone();
-        std::thread::Builder::new().name("epoch".into()).spawn(move || loop {
-            std::thread::sleep(TICK);
-            ticking.increment_epoch();
+        std::thread::Builder::new().name("epoch".into()).spawn(move || {
+            loop {
+                std::thread::sleep(TICK);
+                ticking.increment_epoch();
+            }
         })?;
         let linker = host::linker(&engine)?;
         Ok(Sandbox { engine, linker, egress: Arc::new(egress), compile_cache })
     }
 
     pub async fn load(&self, wasm: &Path) -> anyhow::Result<Loaded> {
-        let component = self.compile(wasm)?;
+        let (engine, cache, path) = (self.engine.clone(), self.compile_cache.clone(), wasm.to_owned());
+        let component = tokio::task::spawn_blocking(move || compile(&engine, cache.as_deref(), &path)).await.context("compiling the extension panicked")??;
         let pre = self
             .linker
             .instantiate_pre(&component)
@@ -113,12 +118,7 @@ impl Sandbox {
         let shared = Arc::new(Shared { name: "extension".into(), store: Arc::new(Store::open(None)?), egress: self.egress.clone(), policy: Policy::None });
         let mut store = host::new_store(&self.engine, shared, MANIFEST_DEADLINE, megabytes(DEFAULT_MEMORY_MB));
         let plugin = pre.instantiate_async(&mut store).await.map_err(anyhow::Error::from)?;
-        let json = plugin
-            .samishisa_extension_extension()
-            .call_manifest(&mut store)
-            .await
-            .map_err(anyhow::Error::from)
-            .context("reading the extension's manifest")?;
+        let json = plugin.samishisa_extension_extension().call_manifest(&mut store).await.map_err(anyhow::Error::from).context("reading the extension's manifest")?;
         serde_json::from_str(&json).context("the extension's manifest is not valid")
     }
 
@@ -130,56 +130,53 @@ impl Sandbox {
         runner.warm_up().await?;
         Ok(runner)
     }
+}
 
-    fn compile(&self, wasm: &Path) -> anyhow::Result<Component> {
-        let bytes = std::fs::read(wasm).with_context(|| format!("reading {}", wasm.display()))?;
-        let invalid = || format!("{} is not a valid WebAssembly component", wasm.display());
-        let Some(cache_dir) = &self.compile_cache else {
-            return Component::new(&self.engine, &bytes).map_err(anyhow::Error::from).with_context(invalid);
-        };
-        let cached = cache_dir.join(format!("{}.cwasm", self.cache_key(&bytes)));
-        if cached.exists() {
-            if let Ok(component) = unsafe { Component::deserialize_file(&self.engine, &cached) } {
-                return Ok(component);
-            }
+fn compile(engine: &Engine, compile_cache: Option<&Path>, wasm: &Path) -> anyhow::Result<Component> {
+    let bytes = std::fs::read(wasm).with_context(|| format!("reading {}", wasm.display()))?;
+    let invalid = || format!("{} is not a valid WebAssembly component", wasm.display());
+    let Some(cache_dir) = compile_cache else {
+        return Component::new(engine, &bytes).map_err(anyhow::Error::from).with_context(invalid);
+    };
+    let cached = cache_dir.join(format!("{}.cwasm", cache_key(engine, &bytes)));
+    if cached.exists() {
+        // SAFETY: the file is our own precompiled output, written atomically into the private data folder.
+        if let Ok(component) = unsafe { Component::deserialize_file(engine, &cached) } {
+            return Ok(component);
         }
-        let started = Instant::now();
-        let native = self.engine.precompile_component(&bytes).map_err(anyhow::Error::from).with_context(invalid)?;
-        log_debug!("core", "compiled {} in {:?}", wasm.display(), started.elapsed());
-        if std::fs::create_dir_all(cache_dir).is_ok() {
-            let partial = cached.with_extension("tmp");
-            if std::fs::write(&partial, &native).is_ok() {
-                let _ = std::fs::rename(&partial, &cached);
-            }
-        }
-        Ok(unsafe { Component::deserialize(&self.engine, &native) }.map_err(anyhow::Error::from)?)
     }
+    let started = Instant::now();
+    let native = engine.precompile_component(&bytes).map_err(anyhow::Error::from).with_context(invalid)?;
+    log_debug!("core", "compiled {} in {:?}", wasm.display(), started.elapsed());
+    if std::fs::create_dir_all(cache_dir).is_ok() {
+        let partial = cached.with_extension("tmp");
+        if std::fs::write(&partial, &native).is_ok() {
+            let _ = std::fs::rename(&partial, &cached);
+        }
+    }
+    // SAFETY: `native` was produced by `precompile_component` of this same engine just now.
+    unsafe { Component::deserialize(engine, &native) }.map_err(anyhow::Error::from)
+}
 
-    fn cache_key(&self, wasm: &[u8]) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut engine_hash = std::collections::hash_map::DefaultHasher::new();
-        self.engine.precompile_compatibility_hash().hash(&mut engine_hash);
-        let mut h = Sha256::new();
-        h.update(wasm);
-        h.update(engine_hash.finish().to_le_bytes());
-        format!("{:x}", h.finalize())[..32].to_owned()
-    }
+fn cache_key(engine: &Engine, wasm: &[u8]) -> String {
+    let engine_hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(engine.precompile_compatibility_hash());
+    let mut h = Sha256::new();
+    h.update(wasm);
+    h.update(engine_hash.to_le_bytes());
+    let mut key = format!("{:x}", h.finalize());
+    key.truncate(32);
+    key
 }
 
 fn new_engine(pool_slots: Option<u32>, max_memory_mb: u32) -> anyhow::Result<Engine> {
     let memory = megabytes(max_memory_mb);
     let mut cfg = WasmConfig::new();
     cfg.epoch_interruption(true)
-        .memory_reservation(memory as u64)
+        .memory_reservation(u64::try_from(memory).unwrap_or(u64::MAX))
         .memory_guard_size(64 << 10);
     if let Some(n) = pool_slots {
         let mut pool = PoolingAllocationConfig::default();
-        pool.total_component_instances(n)
-            .total_core_instances(n * 4)
-            .total_memories(n)
-            .total_tables(n * 4)
-            .total_stacks(n)
-            .max_memory_size(memory);
+        pool.total_component_instances(n).total_core_instances(n * 4).total_memories(n).total_tables(n * 4).total_stacks(n).max_memory_size(memory);
         cfg.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
     }
     Engine::new(&cfg).map_err(anyhow::Error::from)

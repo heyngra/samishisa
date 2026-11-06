@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::{
     cache::ResponseCache,
-    config::{Config, ExtensionEntry, interpolate_env},
+    config::{Config, ExtensionEntry, interpolate_env, listen_address},
     http::{App, Failed, LoadedExtension},
     log::{self, log_error, log_info, log_warn},
     netguard::Egress,
@@ -41,13 +41,7 @@ impl Core {
         };
         let stores = Arc::new(Stores::default());
         stores.delete_expired_every_minute();
-        Ok(Arc::new(Core {
-            sandbox: Sandbox::for_serving(cfg)?,
-            limiter: Arc::new(Limiter::new(redis.clone())),
-            redis,
-            stores,
-            downloader: Egress::for_downloads(),
-        }))
+        Ok(Arc::new(Core { sandbox: Sandbox::for_serving(cfg)?, limiter: Arc::new(Limiter::new(redis.clone())), redis, stores, downloader: Egress::for_downloads() }))
     }
 }
 
@@ -61,6 +55,7 @@ async fn connect_redis(url: &str) -> anyhow::Result<RedisGuard> {
 }
 
 pub async fn build_app(core: &Core, cfg: &Config) -> Arc<App> {
+    let stores_before = store_names(&cfg.data_dir);
     let mut loaded = Vec::new();
     let mut failed = Vec::new();
     for (index, (entry, wasm)) in sources::resolve_all(cfg, &core.downloader, Pins::Keep).await.into_iter().enumerate() {
@@ -79,7 +74,30 @@ pub async fn build_app(core: &Core, cfg: &Config) -> Arc<App> {
     for f in app.failed() {
         log_error!("core", "{} was not loaded: {}", f.source, f.error);
     }
+    warn_about_left_behind_stores(&cfg.data_dir, &stores_before, &app);
     Arc::new(app)
+}
+
+fn store_names(data_dir: &Path) -> Vec<String> {
+    let entries = std::fs::read_dir(data_dir.join("ext")).into_iter().flatten().flatten();
+    entries.filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect()
+}
+
+fn warn_about_left_behind_stores(data_dir: &Path, before: &[String], app: &App) {
+    let mounted: Vec<&str> = app.mounted().iter().map(|m| m.runner.mount.as_str()).collect();
+    let unused: Vec<&str> = before.iter().map(String::as_str).filter(|name| !mounted.contains(name)).collect();
+    if unused.is_empty() {
+        return;
+    }
+    let folder = data_dir.join("ext");
+    for new in mounted.iter().filter(|name| !before.iter().any(|b| b == *name)) {
+        log_warn!(
+            "core",
+            "\"{new}\" starts with an empty store, and {} has data no extension is served under now. If you renamed it, stop samishisa and move that folder to {}",
+            unused.iter().map(|name| folder.join(name).display().to_string()).collect::<Vec<_>>().join(", "),
+            folder.join(new).display()
+        );
+    }
 }
 
 async fn load_extension(core: &Core, cfg: &Config, index: usize, entry: &ExtensionEntry, wasm: anyhow::Result<PathBuf>) -> anyhow::Result<LoadedExtension> {
@@ -107,10 +125,10 @@ impl LiveApp {
         LiveApp(Arc::new(RwLock::new(app)))
     }
     fn current(&self) -> Arc<App> {
-        self.0.read().unwrap().clone()
+        crate::sync::read(&self.0).clone()
     }
     fn replace(&self, app: Arc<App>) {
-        *self.0.write().unwrap() = app;
+        *crate::sync::write(&self.0) = app;
     }
 }
 
@@ -149,10 +167,18 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let terminated = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut terminate) => terminate.recv().await,
+                Err(e) => {
+                    log_warn!("core", "can't listen for SIGTERM ({e}); stop the server with Ctrl-C");
+                    std::future::pending().await
+                }
+            }
+        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            _ = terminated => {}
         }
     }
     #[cfg(not(unix))]
@@ -161,10 +187,6 @@ async fn shutdown_signal() {
 
 fn tokio_runtime(threads: usize) -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread().worker_threads(threads.max(1)).enable_all().build()?)
-}
-
-fn listen_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    format!("{host}:{port}").parse().with_context(|| format!("{host}:{port} is not an address to listen on"))
 }
 
 pub struct ServeRequest {
@@ -192,11 +214,19 @@ impl ServeRequest {
             let absolute = std::fs::canonicalize(wasm).with_context(|| format!("{} not found", wasm.display()))?;
             cfg.extensions.push(ExtensionEntry::from_source(absolute.display().to_string()));
         }
+        cfg.extensions.retain(|e| e.enabled);
+        if self.config_path.exists() {
+            log_info!("core", "config: {}", self.config_path.display());
+        }
+        let no_extensions = cfg.extensions.iter().all(|e| sources::is_server_builtin(&e.source));
         if cfg.extensions.is_empty() && !self.config_path.exists() && sources::has_builtin_hello() {
-            log_info!("core", "no {} here: serving the built-in example (builtin:hello). Run `samishisa init` to create a config.", self.config_path.display());
+            log_info!("core", "no config at {}: serving the built-in example (builtin:hello). Run `samishisa add <source>` to start your own.", self.config_path.display());
             cfg.extensions.push(ExtensionEntry::from_source("builtin:hello"));
-        } else if cfg.extensions.is_empty() {
-            log_warn!("core", "no extensions configured: run `samishisa init`, add some to api.config.json, or pass .wasm files (`samishisa serve hello.wasm`)");
+        } else if no_extensions {
+            log_warn!(
+                "core",
+                "no extensions are enabled: add one with `samishisa add <source>`, switch some on in `samishisa config`, or pass .wasm files (`samishisa run hello.wasm`)"
+            );
         }
         Ok(cfg)
     }
@@ -213,32 +243,77 @@ pub fn serve(request: ServeRequest) -> anyhow::Result<()> {
         let addr = listen_address(&cfg.host, cfg.port)?;
         let app = live.current();
         let failures = if app.failed().is_empty() { String::new() } else { format!(", {} FAILED", app.failed().len()) };
-        log_info!("core", "ready in {:?}: {} extension(s){failures} on http://{addr} ({threads} thread(s)); docs at /docs", started.elapsed(), app.mounted().len());
+        log_info!("core", "ready in {:?}: {} extension(s){failures} on http://{addr} ({threads} thread(s))", started.elapsed(), app.mounted().len());
         drop(app);
+        let _tunnel = crate::tunnel::start(&cfg);
+        let reloader = Arc::new(Reloader { live: live.clone(), core, started_with: cfg.clone(), request, one_at_a_time: tokio::sync::Mutex::new(()) });
         #[cfg(unix)]
-        reload_on_sighup(live.clone(), core, request);
+        tokio::spawn(reload_on_sighup(reloader.clone()));
+        if watches_config() {
+            tokio::spawn(reload_on_config_change(reloader));
+        }
         accept_until_shutdown(live, addr).await
     })
 }
 
-#[cfg(unix)]
-fn reload_on_sighup(live: LiveApp, core: Arc<Core>, request: ServeRequest) {
-    use tokio::signal::unix::{SignalKind, signal};
-    tokio::spawn(async move {
-        let Ok(mut hangup) = signal(SignalKind::hangup()) else { return };
-        while hangup.recv().await.is_some() {
-            log_info!("core", "SIGHUP: reloading {}", request.config_path.display());
-            match request.load_config() {
-                Ok(cfg) => {
-                    let app = build_app(&core, &cfg).await;
-                    let count = app.mounted().len();
-                    live.replace(app);
-                    log_info!("core", "reloaded: {count} extension(s)");
+pub fn watches_config() -> bool {
+    cfg!(not(unix)) || std::env::var("SAMISHISA_WATCH_CONFIG").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+struct Reloader {
+    live: LiveApp,
+    core: Arc<Core>,
+    request: ServeRequest,
+    started_with: Config,
+    one_at_a_time: tokio::sync::Mutex<()>,
+}
+
+impl Reloader {
+    async fn reload(&self, why: &str) {
+        let _one = self.one_at_a_time.lock().await;
+        log_info!("core", "{why}: reloading {}", self.request.config_path.display());
+        match self.request.load_config() {
+            Ok(cfg) => {
+                let app = build_app(&self.core, &cfg).await;
+                let count = app.mounted().len();
+                self.live.replace(app);
+                log_info!("core", "reloaded: {count} extension(s)");
+                let skipped = self.started_with.restart_only_changes(&cfg);
+                if !skipped.is_empty() {
+                    log_warn!("core", "{} changed, but only a restart applies {}", skipped.join(", "), if skipped.len() == 1 { "it" } else { "them" });
                 }
-                Err(e) => log_error!("core", "reload failed, still serving the previous config: {e:#}"),
             }
+            Err(e) => log_error!("core", "reload failed, still serving the previous config: {e:#}"),
         }
-    });
+    }
+}
+
+#[cfg(unix)]
+async fn reload_on_sighup(reloader: Arc<Reloader>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut hangup) = signal(SignalKind::hangup()) else { return };
+    while hangup.recv().await.is_some() {
+        reloader.reload("SIGHUP").await;
+    }
+}
+
+async fn reload_on_config_change(reloader: Arc<Reloader>) {
+    async fn stamp(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+        tokio::fs::metadata(path).await.ok().map(|m| (m.modified().ok(), m.len()))
+    }
+    let path = reloader.request.config_path.clone();
+    log_info!("core", "watching {} for changes", path.display());
+    let mut last = stamp(&path).await;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if stamp(&path).await == last {
+            continue;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        last = stamp(&path).await;
+        reloader.reload("the config file changed").await;
+    }
 }
 
 fn warn_if_world_readable(cfg: &Config) {
@@ -263,6 +338,7 @@ pub fn dev(dir: PathBuf, port: Option<u16>, extension_config: Option<Value>) -> 
     let wasm = scaffold::build(&dir)?;
     let mut cfg = Config { base_dir: dir.clone(), data_dir: dir.join("target/samishisa-dev"), rate_limit: RateSetting::Off, ..Config::default() };
     cfg.network.allow_private = true;
+    cfg.describe_routes = true;
     if let Some(port) = port.or_else(|| std::env::var("PORT").ok().and_then(|p| p.parse().ok())) {
         cfg.port = port;
     }
@@ -270,7 +346,7 @@ pub fn dev(dir: PathBuf, port: Option<u16>, extension_config: Option<Value>) -> 
     if let Some(config) = extension_config {
         entry.config = config;
     }
-    cfg.extensions = vec![entry];
+    cfg.extensions = vec![entry, ExtensionEntry::from_source("builtin:docs")];
 
     tokio_runtime(2)?.block_on(async move {
         let core = Core::start(&cfg).await?;

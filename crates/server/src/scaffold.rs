@@ -7,13 +7,12 @@ use anyhow::{Context, bail};
 
 const TEMPLATE_LIB: &str = r#"//! __NAME__: a samishisa extension.
 //!
-//! Build:  samishisa build            (or: cargo build --release)
-//! Serve:  samishisa serve target/wasm32-wasip2/release/__CRATE__.wasm
-//! Docs:   https://docs.rs/samishisa
+//! Build: `samishisa build` (or `cargo build --release`)
+//! Run:   `samishisa run target/wasm32-wasip2/release/__CRATE__.wasm`
 
 use samishisa::prelude::*;
 
-/// Settings an operator can set in api.config.json.
+/// Settings from `api.config.json`.
 #[schema]
 struct Config {
     /// How to greet people.
@@ -44,9 +43,7 @@ samishisa::export!(extension);
 "#;
 
 pub fn new(name: &str, parent: &Path, sdk_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let valid = name.len() <= 40
-        && name.starts_with(|c: char| c.is_ascii_lowercase())
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let valid = name.len() <= 40 && name.starts_with(|c: char| c.is_ascii_lowercase()) && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if !valid {
         bail!("\"{name}\" is not a valid extension name: use lowercase letters, digits and dashes, starting with a letter");
     }
@@ -90,7 +87,8 @@ pub fn build(dir: &Path) -> anyhow::Result<PathBuf> {
         .stderr(Stdio::inherit())
         .spawn()
         .context("could not run cargo (is Rust installed? https://rustup.rs)")?;
-    let out = std::io::read_to_string(child.stdout.take().expect("piped"))?;
+    let stdout = child.stdout.take().context("cargo's output was not captured")?;
+    let out = std::io::read_to_string(stdout)?;
     let status = child.wait()?;
     let manifest_abs = std::fs::canonicalize(&manifest)?;
     let mut wasm = None;

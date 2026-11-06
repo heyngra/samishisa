@@ -17,7 +17,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints (native crates)
+        run: cargo clippy --locked --all-targets -p samishisa-server -p samishisa-macros -- -D warnings
+      - name: Lints (extension crates, wasm32-wasip2)
+        run: cargo clippy --locked --all-targets --target wasm32-wasip2 -p samishisa -p hello -p probe -- -D warnings
       - name: Build the extensions
         run: cargo build --release --locked --target wasm32-wasip2 -p hello -p probe
       - name: Build the server (embeds builtin:hello)

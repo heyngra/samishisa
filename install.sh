@@ -1,4 +1,17 @@
 #!/bin/sh
+# Installs samishisa on Linux, macOS and WSL:
+#
+#   curl -fsSL https://raw.githubusercontent.com/heyngra/samishisa/main/install.sh | sh
+#
+# Environment variables:
+#   SAMISHISA_VERSION=v0.1.0              release to install (default: latest)
+#   SAMISHISA_INSTALL_DIR=/path           install folder (default: ~/.local/bin)
+#   SAMISHISA_REPO=owner/repo             install from a fork
+#   SAMISHISA_BASE_URL=https://...        download from a mirror (a folder with the release files)
+#   SAMISHISA_URL=https://.../samishisa   direct link to the binary (CDN, file server)
+#   SAMISHISA_SHA256=<hex>                checksum the download must match
+#   SAMISHISA_FILE=/path/samishisa        install a binary you already have, no network
+#   SAMISHISA_EXTENSION=https://.../mio.wasm   also add this extension (any source `samishisa add` accepts)
 set -eu
 
 REPO="${SAMISHISA_REPO:-heyngra/samishisa}"
@@ -50,13 +63,28 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-say "downloading $asset ($VERSION) from $base ..."
-fetch "$base/$asset" "$tmp/samishisa" || die "download failed: $base/$asset"
-fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "download failed: $base/SHA256SUMS"
-expected="$(grep " \*\{0,1\}$asset\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
-[ -n "$expected" ] || die "$asset is not listed in SHA256SUMS"
-actual="$(sha "$tmp/samishisa")"
-[ "$expected" = "$actual" ] || die "checksum mismatch for $asset (expected $expected, got $actual)"
+verify=""
+if [ -n "${SAMISHISA_FILE:-}" ]; then
+  say "using $SAMISHISA_FILE ..."
+  cp "$SAMISHISA_FILE" "$tmp/samishisa"
+  verify="${SAMISHISA_SHA256:-}"
+elif [ -n "${SAMISHISA_URL:-}" ]; then
+  say "downloading $SAMISHISA_URL ..."
+  fetch "$SAMISHISA_URL" "$tmp/samishisa" || die "download failed: $SAMISHISA_URL"
+  verify="${SAMISHISA_SHA256:-}"
+  [ -n "$verify" ] || say "note: no SAMISHISA_SHA256 given, so the download is not verified"
+else
+  say "downloading $asset ($VERSION) from $base ..."
+  fetch "$base/$asset" "$tmp/samishisa" || die "download failed: $base/$asset"
+  fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "download failed: $base/SHA256SUMS"
+  verify="$(grep " \*\{0,1\}$asset\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
+  [ -n "$verify" ] || die "$asset is not listed in SHA256SUMS"
+fi
+if [ -n "$verify" ]; then
+  verify="$(printf '%s' "$verify" | tr 'A-F' 'a-f')"
+  actual="$(sha "$tmp/samishisa")"
+  [ "$verify" = "$actual" ] || die "checksum mismatch (expected $verify, got $actual)"
+fi
 
 mkdir -p "$DIR"
 chmod +x "$tmp/samishisa"
@@ -70,6 +98,39 @@ case ":$PATH:" in
      say "$DIR is not on your PATH. Add it, e.g.:"
      say "  echo 'export PATH=\"$DIR:\$PATH\"' >> ~/.profile && . ~/.profile" ;;
 esac
-say ""
-say "Next:"
-say "  samishisa init my-api && cd my-api && samishisa    # then open http://localhost:3000/docs"
+if [ -n "${SAMISHISA_EXTENSION:-}" ]; then
+  if "$DIR/samishisa" list | grep -qF -- " $SAMISHISA_EXTENSION"; then
+    say "$SAMISHISA_EXTENSION is already in your config"
+  else
+    say "adding $SAMISHISA_EXTENSION ..."
+    "$DIR/samishisa" add "$SAMISHISA_EXTENSION" || die "samishisa add failed"
+  fi
+fi
+say "          MIGGIKKGEGGGGGGGGGGGKQ           
+         KGGGGGGGGGGGGGGIGGGIMOQOY         
+   YWY  WGEGGGIGGGGGGIGGGGGGGGKMQQW        
+   WY Y  OEEGGGGGIIMQSSUUQQKIGGQQQQ        
+   W   W  WIEGIKMQUUWUUUUUUUQOSSSQOW       
+   W   W     OMOUUUUUWUUUOMMUQQOSQS        
+   Y   Y   WSQSUUUUUWWWWUSOMOWSUUW   YYY   
+   Y   YY  WWUSUUUWUSWWWWWWWWWUSUUYY     Y 
+   Y   YYWOMSUSUSWYWSSSUWUWYUWWSUSSUY    W 
+   Y    WOMMSUUSU    WYYY   WUWQQUYUUW YY  
+  W     SOMMSUUQOUWSY   WUWSOSWSOQY UU     
+  Y     YOMMOUUUW          YUWUWSUUUUY     
+ WYY    YSUUUUSSUY  WYYYY YQUUU            
+Y         YWWUQOQOW YYYY  WWUWW            
+                SOS SWYWW WWW Y  S         
+Y    Y           YUUQWWYW SUUU  UOY        
+               YYUUYWW      WUSSW          
+                 YW  Y Y      GIQ          
+    Y            YU YUSSWUY  MGGI          
+Y              YSIO UOQSMKW QGGGGO         
+                YMS MIUWKIW SGGGGGS        
+UY   Y   YYYWWYWMGY UQYYWMS  YOGGEEQ       
+             WWSGG  SSYY UQ   WEGGEEU      "
+say "Samisha has been installed! Next steps:"
+say "  samishisa add <source>      # an extension: github:owner/repo, or the URL of a .wasm"
+say "  samishisa config            # edit your config, manage extensions etc."
+say "  samishisa add builtin:docs  # optional: interactive API docs at /docs"
+say "  samishisa run               # run it on http://localhost:[port] (default 3000)"

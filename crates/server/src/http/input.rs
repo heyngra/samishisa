@@ -20,10 +20,7 @@ pub struct Validators {
 impl Validators {
     pub fn compile(route: &RouteManifest) -> anyhow::Result<Validators> {
         let compile = |schema: &Option<Value>| -> anyhow::Result<Option<jsonschema::Validator>> {
-            schema
-                .as_ref()
-                .map(|s| jsonschema::validator_for(s).map_err(|e| anyhow::anyhow!("{} {}: invalid schema: {e}", route.method, route.path)))
-                .transpose()
+            schema.as_ref().map(|s| jsonschema::validator_for(s).map_err(|e| anyhow::anyhow!("{} {}: invalid schema: {e}", route.method, route.path))).transpose()
         };
         Ok(Validators { params: compile(&route.params)?, query: compile(&route.query)?, body: compile(&route.body)? })
     }
@@ -74,9 +71,8 @@ pub async fn read_json_body(body: Incoming, max_bytes: usize) -> Result<Value, E
     if bytes.is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_slice(&bytes).map_err(|e| {
-        ErrorReply::new(400, "invalid_json", format!("The request body is not valid JSON: {e}")).hint("Send a JSON body with content-type: application/json")
-    })
+    serde_json::from_slice(&bytes)
+        .map_err(|e| ErrorReply::new(400, "invalid_json", format!("The request body is not valid JSON: {e}")).hint("Send a JSON body with content-type: application/json"))
 }
 
 pub fn validation_error(problems: Vec<String>, route: &RouteManifest, usage: &str) -> ErrorReply {

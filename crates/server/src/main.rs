@@ -17,37 +17,41 @@ mod scaffold;
 mod serve;
 mod sources;
 mod store;
+mod sync;
+mod tui;
+mod tunnel;
 
 use std::{path::PathBuf, str::FromStr};
 
 use anyhow::Context;
 use serde_json::Value;
 
-const HELP: &str = "samishisa: one server, many sandboxed WebAssembly extensions
+const HELP: &str = "samishisa
 
 Usage:
-  samishisa [serve] [EXT.wasm ...]     serve ./api.config.json (plus any .wasm files given)
-  samishisa init [DIR]                 create an api.config.json to start from
-  samishisa add <SOURCE> [--name N]    add an extension to api.config.json
+  samishisa run [EXT.wasm ...]         start the server with your config (plus any .wasm files given)
+  samishisa add <SOURCE> [--name N] [--config-json JSON]   add an extension to the config
+  samishisa list                       the extensions in the config
+  samishisa remove <NAME>              take an extension out of the config
+  samishisa config                     the config screen: extensions on/off, their settings, the tunnel
+  samishisa config [path | show | edit]  where the config is / print it / open the file in your editor
+  samishisa config set [EXT] KEY VALUE set a setting: `config set port 8080`, `config set mio anilist.client_id 123`
+  samishisa init [DIR]                 create an api.config.json in DIR (a project folder) to start from
   samishisa update                     re-resolve remote extensions and move their pins (api.lock.json)
   samishisa new <NAME> [--sdk PATH]    create an extension crate in ./<NAME>
   samishisa build [DIR]                compile the extension crate in DIR (default .)
   samishisa dev [DIR] [--config-json JSON]  build, serve, and rebuild + reload on every change
   samishisa inspect <EXT.wasm>         show an extension's routes and settings
-  samishisa healthcheck                exit 0 if the local server answers /health (for Docker)
+  samishisa healthcheck                exit 0 if the local server answers /health (for Docker; uses the config's port)
   samishisa version | help
 
 Options:
-  --config FILE    config file (default ./api.config.json, or $API_CONFIG)
-  --port N         listen port (default 3000, or $PORT)
-  --host ADDR      listen address (default 0.0.0.0 = every interface; 127.0.0.1 = this machine only)
-  --threads N      serving threads (default: one per CPU core)
-
-Files: ./api.config.json (settings), ./api.lock.json (pinned downloads), ./data/ (extension stores,
-downloads, compiled code; move it with dataDir in the config or $SAMISHISA_DATA).
-Sources: ./ext.wasm, ./crate-folder, builtin:hello, github:owner/repo[#tag], https://.../ext.wasm
-Environment: API_CONFIG, PORT, REDIS_URL, SAMISHISA_DATA, LOG_LEVEL (debug|info|warn|error), GITHUB_TOKEN
-Reload: send SIGHUP to re-read the config without dropping connections.";
+  --config FILE    config file (default: ./api.config.json if it exists, else the user config, or $API_CONFIG);
+                   run, add, list, remove, config, update, healthcheck
+  --port N         listen port (default 3000, or $PORT): run, dev, healthcheck
+  --host ADDR      listen address, an IP (default 0.0.0.0 = every interface; 127.0.0.1 = this machine only): run
+  --threads N      serving threads (default: one per CPU core): run
+";
 
 fn main() {
     log::init_from_env();
@@ -59,17 +63,31 @@ fn main() {
 }
 
 fn run(all: Vec<String>) -> anyhow::Result<()> {
-    let command = all.first().map(String::as_str).unwrap_or("serve");
+    let command = all.first().map(String::as_str).unwrap_or("help");
     let mut args = Args(all.get(1..).unwrap_or_default().to_vec());
     match command {
         "help" | "--help" | "-h" => println!("{HELP}"),
         "version" | "--version" | "-V" => println!("samishisa {}", env!("CARGO_PKG_VERSION")),
-        "serve" => serve_command(args)?,
+        "run" | "serve" | "start" => serve_command(args)?,
         "dev" => {
             let port = args.number("--port")?;
             let extension_config = args.json("--config-json")?;
             let dir = commands::dir_or_current(args.positional()?.first());
             serve::dev(dir, port, extension_config)?;
+        }
+        "config" => {
+            let (config_path, _) = args.config_path()?;
+            commands::config(&config_path, args.positional()?)?;
+        }
+        "list" => {
+            let (config_path, _) = args.config_path()?;
+            args.positional()?;
+            commands::list(&config_path)?;
+        }
+        "remove" => {
+            let (config_path, _) = args.config_path()?;
+            let [name] = args.positional()?.try_into().map_err(|_| anyhow::anyhow!("usage: samishisa remove <NAME>"))?;
+            commands::remove(&config_path, &name)?;
         }
         "init" => commands::init(&commands::dir_or_current(args.positional()?.first()))?,
         "add" => {
@@ -95,10 +113,12 @@ fn run(all: Vec<String>) -> anyhow::Result<()> {
             commands::inspect(&PathBuf::from(wasm), true)?;
         }
         "healthcheck" => {
-            let port = args.number("--port")?.or_else(|| std::env::var("PORT").ok().and_then(|p| p.parse().ok())).unwrap_or(3000);
-            commands::healthcheck(port);
+            let (config_path, _) = args.config_path()?;
+            let port = args.number("--port")?;
+            args.positional()?;
+            commands::healthcheck(&config_path, port);
         }
-        _ => serve_command(Args(all.clone()))?,
+        other => anyhow::bail!("unknown command {other:?}. Run `samishisa help` for the list."),
     }
     Ok(())
 }
@@ -138,7 +158,7 @@ impl Args {
     fn config_path(&mut self) -> anyhow::Result<(PathBuf, bool)> {
         Ok(match self.flag("--config")?.or_else(|| std::env::var("API_CONFIG").ok()) {
             Some(path) => (PathBuf::from(path), true),
-            None => (PathBuf::from("api.config.json"), false),
+            None => (config::default_path(), false),
         })
     }
 

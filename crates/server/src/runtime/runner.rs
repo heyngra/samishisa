@@ -15,7 +15,7 @@ use super::{
     host::{Shared, State, new_store},
     ticks,
 };
-use crate::{manifest::Manifest, netguard::Policy};
+use crate::{manifest::Manifest, netguard::Policy, sync::lock};
 
 const MAX_INSTANCES_PER_EXTENSION: usize = 64;
 const RECYCLE_AFTER_CALLS: u32 = 10_000;
@@ -126,7 +126,7 @@ impl Runner {
     }
 
     async fn checkout(&self) -> Result<Instance, CallError> {
-        if let Some(instance) = self.idle.lock().unwrap().pop() {
+        if let Some(instance) = lock(&self.idle).pop() {
             return Ok(instance);
         }
         let slot = Slot::reserve(&self.live).ok_or(CallError::Busy)?;
@@ -152,7 +152,7 @@ impl Runner {
     fn give_back(&self, mut instance: Instance) {
         instance.calls += 1;
         if instance.calls < RECYCLE_AFTER_CALLS {
-            self.idle.lock().unwrap().push(instance);
+            lock(&self.idle).push(instance);
         }
     }
 }

@@ -2,15 +2,15 @@ use std::io::Write;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{HeaderMap, Response};
+use hyper::{
+    HeaderMap, Response,
+    header::{CONTENT_ENCODING, HeaderValue, VARY},
+};
 
 const MIN_BYTES: usize = 1024;
 
 pub fn accepts_gzip(request_headers: &HeaderMap) -> bool {
-    request_headers
-        .get("accept-encoding")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|encoding| encoding.trim().starts_with("gzip")))
+    request_headers.get("accept-encoding").and_then(|v| v.to_str().ok()).is_some_and(|v| v.split(',').any(|encoding| encoding.trim().starts_with("gzip")))
 }
 
 fn is_compressible(content_type: &str) -> bool {
@@ -47,8 +47,8 @@ pub async fn compress(response: Response<Full<Bytes>>) -> Response<Full<Bytes>> 
     let Some(gz) = gz else {
         return Response::from_parts(parts, Full::new(raw));
     };
-    parts.headers.insert("content-encoding", "gzip".parse().expect("static"));
-    parts.headers.append("vary", "accept-encoding".parse().expect("static"));
+    parts.headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    parts.headers.append(VARY, HeaderValue::from_static("accept-encoding"));
     parts.headers.remove("content-length");
     Response::from_parts(parts, Full::new(gz))
 }

@@ -19,3 +19,6 @@ wit-bindgen = "0.63"
 
 [package.metadata.docs.rs]
 targets = ["wasm32-wasip2"]
+
+[lints]
+workspace = true

@@ -1,13 +1,16 @@
+//! Internal glue between the builder API and the WIT exports. Not part of the public API.
+
 use std::{cell::RefCell, rc::Rc};
 
 use serde_json::json;
 
 use crate::{
-    ApiError, Config, Ctx, Extension, RequestParts,
     __bindings::samishisa::extension::{host, types as wit},
+    ApiError, Config, Ctx, Extension, RequestParts,
     extension::config_schema_of,
 };
 
+/// Object-safe view of a built extension, with its config type erased.
 pub trait Erased {
     fn manifest(&self) -> String;
     fn init(&mut self, config_json: &str) -> Result<(), String>;
@@ -16,6 +19,7 @@ pub trait Erased {
     fn run_job(&self, job: u32) -> Result<(), String>;
 }
 
+/// An [`Extension`] plus what `export!` needs to know about the crate.
 pub struct Built<C> {
     ext: Extension<C>,
     crate_version: &'static str,
@@ -31,27 +35,15 @@ impl<C> Built<C> {
 
 impl ApiError {
     pub(crate) fn from_wit(e: wit::ApiError) -> Self {
-        Self {
-            status: e.status,
-            code: e.code,
-            message: e.message,
-            hint: e.hint,
-            details: e.details_json.and_then(|d| serde_json::from_str(&d).ok()),
-            internal: None,
-        }
+        Self { status: e.status, code: e.code, message: e.message, hint: e.hint, details: e.details_json.and_then(|d| serde_json::from_str(&d).ok()), internal: None }
     }
 
+    /// Logs the hidden part, if any, then converts the value for the wire.
     fn into_wit(self, request_id: &str) -> wit::ApiError {
         if let Some(internal) = &self.internal {
             host::log(host::LogLevel::Error, &format!("[{request_id}] {} {}: {internal}", self.status, self.message));
         }
-        wit::ApiError {
-            status: self.status.clamp(400, 599),
-            code: self.code,
-            message: self.message,
-            hint: self.hint,
-            details_json: self.details.map(|d| d.to_string()),
-        }
+        wit::ApiError { status: self.status.clamp(400, 599), code: self.code, message: self.message, hint: self.hint, details_json: self.details.map(|d| d.to_string()) }
     }
 }
 
@@ -79,7 +71,7 @@ impl<C: Config> Erased for Built<C> {
             "network": e.network,
             "rateLimit": e.rate_limit.map(|r| r.to_json()),
             "routes": e.routes.iter().map(|r| r.spec.to_json()).collect::<Vec<_>>(),
-            "jobs": e.jobs.iter().map(|j| json!({ "everyMs": j.every.as_millis() as u64 })).collect::<Vec<_>>(),
+            "jobs": e.jobs.iter().map(|j| json!({ "everyMs": u64::try_from(j.every.as_millis()).unwrap_or(u64::MAX) })).collect::<Vec<_>>(),
             "setup": e.setup.is_some(),
             "errors": errors,
         })
@@ -129,6 +121,7 @@ thread_local! {
     static EXT: RefCell<Option<Box<dyn Erased>>> = const { RefCell::new(None) };
 }
 
+/// Runs `f` on this instance's extension, building it on first use.
 fn with<R>(build: fn() -> Box<dyn Erased>, f: impl FnOnce(&mut dyn Erased) -> R) -> R {
     EXT.with(|cell| f(cell.borrow_mut().get_or_insert_with(build).as_mut()))
 }

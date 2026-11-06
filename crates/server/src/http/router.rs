@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use anyhow::Context;
+
 use super::{describe::usage, input::Validators};
 use crate::{
     cache::CacheRule,
@@ -38,7 +40,7 @@ impl Route {
             })
             .collect();
         Ok(Route {
-            index: index as u32,
+            index: u32::try_from(index).context("too many routes")?,
             literal_count: segments.iter().filter(|s| matches!(s, Segment::Literal(_))).count(),
             segments,
             usage: usage(mount, spec),
@@ -67,8 +69,13 @@ impl Route {
 }
 
 pub enum Match<'r, 'p> {
-    Found { route: &'r Route, params: Vec<(&'r str, &'p str)> },
-    WrongMethod { allowed: Vec<&'r str> },
+    Found {
+        route: &'r Route,
+        params: Vec<(&'r str, &'p str)>,
+    },
+    WrongMethod {
+        allowed: Vec<&'r str>,
+    },
     NotFound,
 }
 
@@ -107,11 +114,7 @@ pub fn closest<'a>(word: &str, candidates: impl Iterator<Item = &'a str>) -> Opt
         }
         previous[b.len()]
     }
-    candidates
-        .map(|c| (edit_distance(word, c), c))
-        .filter(|(distance, c)| *distance <= 2.max(c.len() / 3))
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, c)| c)
+    candidates.map(|c| (edit_distance(word, c), c)).filter(|(distance, c)| *distance <= 2.max(c.len() / 3)).min_by_key(|(distance, _)| *distance).map(|(_, c)| c)
 }
 
 #[cfg(test)]

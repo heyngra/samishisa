@@ -96,8 +96,8 @@ TMP = tempfile.mkdtemp(prefix="samishisa-e2e-")
 
 
 class Server:
-    def __init__(self, name, port, cfg):
-        self.port, self.dir = port, os.path.join(TMP, name)
+    def __init__(self, name, port, cfg, env=None):
+        self.port, self.dir, self.extra_env = port, os.path.join(TMP, name), env or {}
         os.makedirs(self.dir, exist_ok=True)
         self.cfg_path = os.path.join(self.dir, "api.config.json")
         self.write(cfg)
@@ -111,7 +111,7 @@ class Server:
 
     def start(self):
         self.log = open(self.log_path, "a")
-        env = dict(os.environ, LOG_LEVEL="info")
+        env = dict(os.environ, LOG_LEVEL="info", **self.extra_env)
         env.pop("REDIS_URL", None)
         self.proc = subprocess.Popen([BIN, "serve", "--config", self.cfg_path, "--threads", "2"], stdout=self.log, stderr=self.log, env=env)
         for _ in range(300):
@@ -145,11 +145,13 @@ def main():
     print("== main server")
     main_cfg = {
         "rateLimit": {"limit": 1000, "windowSec": 60},
+        "describeRoutes": True,
         "extensions": [
             {"source": HELLO, "config": {"greeting": "Hey"}},
             PROBE,
             {"source": HELLO, "name": "typo", "config": {"greting": "x"}},
             "./does-not-exist.wasm",
+            "builtin:docs",
         ],
     }
     s = Server("main", 3911, main_cfg).start()
@@ -193,6 +195,8 @@ def main():
         st, h2, c2 = req(p, "/probe/cached")
         check("cache: second call is a HIT with the same body", h1.get("x-cache") == "MISS" and h2.get("x-cache") == "HIT" and c1 == c2, (h1.get("x-cache"), h2.get("x-cache"), c1, c2))
         check("cache: Cache-Control and ETag", "max-age=" in h2.get("cache-control", "") and h2.get("etag"), h2)
+        st, h4, c4 = req(p, "/probe/cached", headers={"authorization": "Bearer someone"})
+        check("cache: a request with credentials skips the shared cache", st == 200 and "x-cache" not in h4 and h4.get("cache-control") == "private, no-store" and c4 != c2, (h4.get("x-cache"), h4.get("cache-control"), c4, c2))
         st, h3, _ = req(p, "/probe/cached", headers={"if-none-match": h2.get("etag", "")}, raw=True)
         check("cache: If-None-Match gives 304", st == 304, st)
 
@@ -258,8 +262,14 @@ def main():
         check("CORS preflight", st == 204 and "POST" in h.get("access-control-allow-methods", ""), (st, h))
         st, _, spec = req(p, "/openapi.json")
         check("OpenAPI document", st == 200 and spec["openapi"] == "3.1.0" and "/hello/{name}" in spec["paths"], list(spec.get("paths", {}))[:5])
+        st, _, one = req(p, "/openapi/hello.json")
+        check("one extension's OpenAPI", st == 200 and one["info"]["title"] == "hello" and all(k.startswith("/hello/") for k in one["paths"]) and one["paths"], list(one.get("paths", {}))[:5])
+        st, _, miss = req(p, "/openapi/nope.json")
+        check("an unknown extension's OpenAPI is a 404 listing the others", st == 404 and "/openapi/probe.json" in miss["error"]["details"]["available"], miss)
+        check("the index links each extension's OpenAPI", idx["extensions"][0].get("openapi") == "/openapi/hello.json", idx["extensions"][0])
         st, _, html = req(p, "/docs")
-        check("docs page", st == 200 and "api-reference" in html)
+        check("docs page (builtin:docs), its script pinned by integrity hash", st == 200 and "api-reference" in html and 'integrity="sha384-' in html)
+        check("the index links the docs page when it is on", idx.get("docs") == "/docs", idx.get("docs"))
         st, _, d = req(p, "/probe")
         check("GET /<ext> describes routes", any(r["path"] == "/probe/limited" and r["rateLimit"]["limit"] == 3 for r in d["routes"]), d)
 
@@ -285,6 +295,24 @@ def main():
     finally:
         s.stop()
 
+    print("== route listings are opt-in")
+    q = Server("quiet", 3914, {"extensions": [PROBE]}).start()
+    try:
+        st, _, idx = req(q.port, "/")
+        check("the index shows only the name while describeRoutes is off", st == 200 and idx == {"name": "samishisa"}, idx)
+        st, _, b = req(q.port, "/probe")
+        check("GET /<ext> is not a route listing while describeRoutes is off", st == 404 and "/probe/limited" not in json.dumps(b), b)
+        st, _, b = req(q.port, "/probe/nope")
+        check("a 404 for a wrong path doesn't list the routes", st == 404 and "/probe/limited" not in json.dumps(b), b)
+        st, _, b = req(q.port, "/openapi.json")
+        check("/openapi.json is off", st == 404, st)
+        st, _, b = req(q.port, "/openapi/probe.json")
+        check("/openapi/<ext>.json is off", st == 404, st)
+        st, _, b = req(q.port, "/probe/limited")
+        check("the routes themselves still work", st == 200, (st, b))
+    finally:
+        q.stop()
+
     print("== remote sources, allowPrivate")
     UPSTREAM_FILES["/hello.wasm"] = open(HELLO, "rb").read()
     url = "http://127.0.0.1:%d/hello.wasm" % UPSTREAM_PORT
@@ -307,6 +335,7 @@ def main():
         r.stop()
     cfg = json.load(open(r.cfg_path))
     cfg["extensions"][0]["sha256"] = "00" * 32
+    cfg["describeRoutes"] = True
     r.write(cfg)
     r.start()
     try:
@@ -314,6 +343,22 @@ def main():
         check("a sha256 mismatch refuses the extension", any("SHA-256" in f["error"] for f in idx["failed"]), idx["failed"])
     finally:
         r.stop()
+
+    print("== config watching")
+    w = Server("watch", 3912, {"extensions": [HELLO]}, env={"SAMISHISA_WATCH_CONFIG": "1"}).start()
+    try:
+        check("before the rename", req(w.port, "/hello/Ada")[0] == 200)
+        w.write({"extensions": [{"source": HELLO, "name": "hi3"}]})
+        for _ in range(60):
+            st, _, b = req(w.port, "/hi3/Ada")
+            if st == 200:
+                break
+            time.sleep(0.1)
+        check("saving the config reloads it (SAMISHISA_WATCH_CONFIG)", st == 200, (st, b))
+        log = w.logtext()
+        check("a renamed extension is told where its old store is", "\"hi3\" starts with an empty store" in log and os.path.join("ext", "hello") in log, log[-600:])
+    finally:
+        w.stop()
 
     print("== builtin and CLI")
     out = subprocess.run([BIN, "init", os.path.join(TMP, "init")], capture_output=True, text=True)
@@ -324,6 +369,10 @@ def main():
         try:
             st, _, body = req(b.port, "/hello/world")
             check("builtin:hello works out of the box", st == 200 and body == {"message": "Hello, world!"}, body)
+            st, _, body = req(b.port, "/docs")
+            check("the docs page is off unless builtin:docs is listed", st == 404 and "builtin:docs" in body["error"]["hint"], body)
+            st, _, body = req(b.port, "/openapi.json")
+            check("OpenAPI is off by default, even without builtin:docs", st == 404, st)
             hc = subprocess.run([BIN, "healthcheck", "--port", str(b.port)])
             check("healthcheck succeeds against a running server", hc.returncode == 0)
         finally:
