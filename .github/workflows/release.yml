@@ -72,8 +72,8 @@ jobs:
         run: |
           ./dist/${{ matrix.asset }} version
           ./dist/${{ matrix.asset }} init smoke
-          cd smoke && (../dist/${{ matrix.asset }} --port 3999 &) && sleep 3
-          curl -fsS localhost:3999/hello/world
+          cd smoke && (../dist/${{ matrix.asset }} run &) && sleep 3
+          curl -fsS localhost:3000/hello/world
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
