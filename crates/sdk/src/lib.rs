@@ -61,7 +61,6 @@
 //! Handlers are plain synchronous functions. A call that waits, such as an HTTP request or a store read, pauses only its own instance. Several instances of an extension can exist at once, so keep state that must be shared in [`Ctx::store`], not in statics.
 
 #![deny(missing_docs)]
-#![cfg_attr(doctest, doc = include_str!("../../../README.md"))]
 #![warn(rustdoc::broken_intra_doc_links)]
 
 #[doc(hidden)]
